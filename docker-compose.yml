@@ -1,0 +1,50 @@
+version: "3.9"
+
+services:
+
+  # ── Qdrant vector store ───────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: multimodal_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Multimodal RAG app ────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: multimodal_rag
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Point the app at the Qdrant service defined above
+      QDRANT_URL: http://qdrant:6333
+    volumes:
+      # Persist ingested documents and the local doc store
+      - ./data:/app/data
+      - doc_store:/app/doc_store
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    # Default: keep the container alive so you can exec into it.
+    # For the API server, change the command to:
+    #   command: uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload
+    command: ["python", "main.py", "--help"]
+    ports:
+      - "8000:8000"
+
+volumes:
+  qdrant_data:
+  doc_store:

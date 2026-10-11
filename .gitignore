@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+
+# Document store (generated at runtime)
+doc_store/
+
+# Qdrant local storage
+qdrant_storage/
+
+# Evaluation outputs
+*.json
+!data/eval_dataset.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

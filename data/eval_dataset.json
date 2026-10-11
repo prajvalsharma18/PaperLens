@@ -1,0 +1,10 @@
+[
+  {
+    "question": "Replace this with a real question about your document.",
+    "answer": "Replace this with the answer your pipeline produces.",
+    "contexts": [
+      "Replace this with the retrieved context string(s) used to generate the answer."
+    ],
+    "ground_truth": "Replace this with the correct expected answer."
+  }
+]
