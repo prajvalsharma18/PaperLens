@@ -56,9 +56,11 @@ def test_generation_sends_table_text_and_original_image(tmp_path, monkeypatch):
     request = client.chat.completions.create.call_args.kwargs
     user_content = request["messages"][1]["content"]
     assert user_content[0]["type"] == "text"
-    assert "[Table]:\n<table>Revenue</table>" in user_content[0]["text"]
+    assert "[Table E-" in user_content[0]["text"]
+    assert "<table>Revenue</table>" in user_content[0]["text"]
     assert "Question: What trend is shown?" in user_content[0]["text"]
-    assert user_content[1] == {
+    assert user_content[1]["text"].startswith("Image evidence: Retrieved source")
+    assert user_content[2] == {
         "type": "image_url",
         "image_url": {
             "url": "data:image/png;base64,"
@@ -114,10 +116,16 @@ def test_generation_sends_multiple_labeled_images_in_context_order(
     user_content = client.chat.completions.create.call_args.kwargs["messages"][1][
         "content"
     ]
-    assert [block.get("text") for block in user_content[1::2]] == [
-        "Image evidence: Document report, page 3",
-        "Image evidence: Document report, page 1",
-    ]
+    assert all(
+        actual.startswith(expected)
+        for actual, expected in zip(
+            [block["text"] for block in user_content[1::2]],
+            [
+                "Image evidence: Document report, page 3 [evidence E-",
+                "Image evidence: Document report, page 1 [evidence E-",
+            ],
+        )
+    )
     assert [block["image_url"]["url"] for block in user_content[2::2]] == [
         "data:image/png;base64," + base64.b64encode(data).decode("ascii")
         for data in image_bytes
@@ -149,7 +157,7 @@ def test_generation_uses_vision_summary_when_image_path_is_missing(
         "content"
     ]
     assert len(user_content) == 1
-    assert "[Figure]: A rising revenue line." in user_content[0]["text"]
+    assert "A rising revenue line." in user_content[0]["text"]
 
 
 def test_generation_rejects_missing_required_image_and_falls_back_for_corrupt_optional(
@@ -183,7 +191,7 @@ def test_generation_rejects_missing_required_image_and_falls_back_for_corrupt_op
     user_content = client.chat.completions.create.call_args.kwargs["messages"][1][
         "content"
     ]
-    assert "[Figure]: Stored chart description." in user_content[0]["text"]
+    assert "Stored chart description." in user_content[0]["text"]
     assert "is corrupt; using its text summary" in capsys.readouterr().err
 
     required_corrupt = {
@@ -207,3 +215,69 @@ def test_generation_does_not_swallow_openai_errors(monkeypatch):
 
     with pytest.raises(RuntimeError, match="API unavailable"):
         generate_answer("Question?", [{"type": "NarrativeText", "content": "Text"}])
+
+
+def test_evidence_ids_preserve_identity_and_reject_unknown_answer_citations():
+    from generation.evidence_builder import (
+        build_evidence_package,
+        format_source_citations,
+        validate_answer_citations,
+    )
+
+    package = build_evidence_package([
+        {
+            "uuid": "element-7",
+            "type": "NarrativeText",
+            "content": "A source fact.",
+            "metadata": {
+                "document_id": "report",
+                "source_file": "report.pdf",
+                "page": 4,
+                "element_id": "element-7",
+            },
+        }
+    ])
+    evidence_id = package[0]["metadata"]["evidence_id"]
+    assert evidence_id.startswith("E-")
+    assert package[0]["metadata"]["page"] == 4
+    citations = format_source_citations(package)
+    assert "report.pdf, page 4, document ID: report, element element-7" in citations[0]
+    assert validate_answer_citations(
+        f"Supported [{evidence_id}] and unsupported [E-0000000000].", package
+    ) == f"Supported [{evidence_id}] and unsupported ."
+
+
+def test_image_budget_reserves_slots_for_required_pages(tmp_path, monkeypatch):
+    from generation.rag_chain import generate_answer
+
+    paths = [tmp_path / f"image-{index}.png" for index in range(2)]
+    for path in paths:
+        path.write_bytes(_png_bytes((10, 20, 30)))
+    client = _mock_openai_client()
+    monkeypatch.setattr("openai.OpenAI", lambda: client)
+    monkeypatch.setenv("MAX_IMAGE_INPUTS", "1")
+    answer = generate_answer(
+        "Compare pages.",
+        [
+            {
+                "uuid": "optional",
+                "type": "Image",
+                "content": "",
+                "metadata": {"image_path": str(paths[0])},
+            },
+            {
+                "uuid": "page-2",
+                "type": "Image",
+                "content": "",
+                "metadata": {
+                    "image_path": str(paths[1]),
+                    "evidence_label": "Document report, page 2",
+                    "require_image_evidence": True,
+                },
+            },
+        ],
+    )
+    assert answer == "Generated answer"
+    content = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    assert "was not visually inspected" in content[0]["text"]
+    assert "Document report, page 2" in content[1]["text"]

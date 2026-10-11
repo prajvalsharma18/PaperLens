@@ -82,6 +82,27 @@ if (Test-Path .\.venv\Scripts\python.exe) {
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
+## Streamlit frontend
+
+PaperLens includes a frontend-only Streamlit workspace for document uploads,
+manifest-backed document discovery, multimodal queries, page comparisons,
+visual evidence previews, visual indexing, structured extraction, and service
+diagnostics. Install the project requirements, then launch from the project
+directory:
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+The frontend invokes the existing `main.py` commands as subprocesses using the
+active Python interpreter. Uploading only saves a document; ingestion begins
+after an explicit confirmation and may incur OpenAI API charges. Query,
+extraction, and visual indexing are also user-triggered. The home page uses
+read-only manifest and Qdrant status checks; it does not create collections or
+call OpenAI. Configure `PAPERLENS_MAX_UPLOAD_MB` (default `100`) and
+`PAPERLENS_CLI_TIMEOUT` (default `1800` seconds) to adjust upload and operation
+limits.
+
 Set `OPENAI_API_KEY` in a local `.env` file (copy `.env.example` only if `.env`
 does not already exist). Ingestion indexing and querying make OpenAI API calls.
 The automated unit tests mock those calls and need no API key.
@@ -167,11 +188,58 @@ when more than one PDF has been ingested.
 
 Semantic visual retrieval can only find content represented by existing
 indexed text, captions, summaries, OCR, and figure records. It does not search
-Phase 3 child tiles or identify a requested region unless the available
-evidence itself makes that region clear. Numerical chart questions may send
-the retrieved chart image to the vision-capable generator, but PaperLens does
-not digitize chart data or guarantee exact values; estimates must be treated
-as visual interpretation, not structured extraction.
+for a requested region unless the available evidence itself makes that region
+clear. Phase 6 adds local structured extraction for preserved table HTML and
+conservative numerical processing of explicitly tagged bar charts; the
+limitations below are important.
+
+### Local table and chart evidence
+
+After ingesting a document, run local extraction with:
+
+```powershell
+.\.venv\Scripts\python.exe main.py extract-data --document-id "YOUR_DOCUMENT_ID"
+```
+
+HTML table cells are parsed locally and stored in the document manifest with
+their source element, page, extraction method, and status. Plain-text tables
+are kept as incomplete evidence because cell boundaries may not be reliable.
+Image-only tables may return OCR text when Tesseract is installed, but OCR text
+is not represented as verified cells. Extraction updates only structured
+evidence in the selected manifest; it does not re-index or replace existing
+Qdrant collections.
+
+Chart digitization is opt-in through existing element metadata and deliberately
+limited to explicitly identified vertical bars/histograms with a supplied
+pixel `plot_area` and linear y-axis. It relies on OCR token boxes for ticks and
+labels. A supported chart without sufficient calibration, recognized labels,
+or valid geometry yields incomplete evidence rather than guessed values.
+OCR-read labels and axis-digitized values are not human verified; digitized
+values are estimates. Other chart types and nonlinear axes are marked
+unsupported. No title/axis/plot-boundary discovery or automated chart
+classification is performed.
+
+Clear maximum/minimum, two-item difference/comparison, sum/total, and single
+value questions can be answered deterministically from unambiguous structured
+evidence, with page/element provenance and extraction status. Numerical visual
+questions without sufficient supported evidence fail closed rather than
+inventing values. Exact-page queries retain their existing page-evidence path.
+This is not an evaluation of chart accuracy or retrieval quality; review
+extracted records against representative source documents before relying on
+them.
+
+An offline, synthetic smoke benchmark is available with:
+
+```powershell
+.\.venv\Scripts\python.exe -m evaluation.structured_extraction_benchmark
+```
+
+It reports exact table-cell match, synthetic bar/category association,
+estimated-value mean absolute error, provenance correctness, and
+incomplete/unsupported record counts. Direct-label accuracy is reported as
+not measured because the fixture does not contain printed data labels. These
+tiny generated fixtures validate plumbing only, not OCR performance or
+real-document extraction accuracy.
 
 ### Direct visual retrieval
 
@@ -203,9 +271,13 @@ questions still use the exact manifest/page path and bypass semantic and visual
 search. General text questions do not load the visual model. An absent or
 empty visual index falls back to text retrieval with a diagnostic.
 
-The visual retrieval metric helper is deterministic and does not need Qdrant,
-model weights, or API credentials. Given labelled rankings, it computes macro
-Recall@k and MRR:
+The ranking metric helper is deterministic and does not need Qdrant, model
+weights, or API credentials. It computes macro Recall@k, MRR, and nDCG@k over
+rankings and explicit relevance judgements. Recall@k is the fraction of known
+relevant items found in the first `k`; MRR is the reciprocal rank of the first
+relevant result averaged across queries; nDCG@k discounts lower ranked results
+and supports graded relevance. A no-ground-truth case scores zero and remains
+in the denominator; failed retrievals are also retained as empty rankings.
 
 ```python
 from evaluation.retrieval_metrics import evaluate_retrieval
@@ -220,8 +292,79 @@ scores = evaluate_retrieval(
 The automated metric tests use constructed rankings to verify the calculation;
 they are not a retrieval-quality benchmark and do not demonstrate gains on
 real documents. Evaluate representative labelled queries and report those
-results separately. The existing `evaluation/benchmark.py` remains the
-answer-generation comparison utility and may make external model calls.
+results separately.
+
+### Reproducible evaluation runner
+
+The version 1 labelled dataset schema and annotation guidance are in
+`evaluation/datasets/`. The checked-in answer fixture contains controlled
+mocked strings; there are currently no manually labelled real-document cases
+or PDFs in the repository. Run the offline synthetic extraction and answer
+checks, or a labelled retrieval experiment, with:
+
+```powershell
+.\.venv\Scripts\python.exe -m evaluation.benchmark --mode all --dataset evaluation/datasets/answer-fixtures.json
+.\.venv\Scripts\python.exe -m evaluation.benchmark --mode retrieval --dataset path\to\labelled-dataset.json --split test --allow-remote-text-embeddings
+.\.venv\Scripts\python.exe -m evaluation.benchmark --mode extraction
+.\.venv\Scripts\python.exe -m evaluation.benchmark --mode answers --dataset evaluation/datasets/answer-fixtures.json
+.\.venv\Scripts\python.exe -m evaluation.benchmark --mode generation-input --dataset path\to\labelled-dataset.json --split test --allow-remote-text-embeddings --run-generation
+```
+
+Each run writes a unique JSON report and Markdown summary under
+`evaluation/reports/` by default. Existing report files are never overwritten.
+Retrieval compares text, CLIP visual, and the existing RRF hybrid results at
+the same cutoffs and reports per-case rankings, failures, no-results, valid
+ground-truth counts, and category aggregates. Exact page lookups are listed as
+controls and excluded from similarity comparisons. Text embeddings are remote
+and opt-in; CLIP uses cached weights only. Empty or unavailable indexes and
+retrieval failures are retained explicitly.
+
+The extraction mode executes the existing table and supported bar-chart
+extractors on generated fixtures. It reports table cell/header/structure exact
+match, source provenance, chart category association, digitized numeric MAE
+with a `0.1` fixture-specific tolerance, and incomplete/unsupported rates with
+denominators. Direct OCR data-label accuracy has denominator zero in this
+fixture and is reported as not measured. Answer checks cover required facts,
+forbidden facts, citations, numeric values/units and abstention on controlled
+strings. These are evaluator plumbing checks; they do not measure real
+retrieval, arbitrary-answer factuality, or actual model behavior. RAGAS remains
+available separately through `evaluation.ragas_evaluator` and is not invoked
+by the offline runner.
+
+The separate generation-input mode retrieves once, holds the selected textual
+context constant, and compares a text-only generation call with a second call
+that adds associated retrieved images. It requires --allow-remote-text-embeddings
+and the explicit --run-generation opt-in; that mode can incur API charges. It
+reports attempted generation calls but does not estimate cost when provider
+usage data is unavailable.
+
+### Evidence-grounded answer generation
+
+Before generation, retrieved items receive stable query-scoped evidence IDs
+derived from their existing element or record identity. The prompt includes
+those IDs and available document, page, element, and crop labels; source
+citations printed after the answer are built from the same supplied items.
+Model citation tokens are retained only when their evidence ID exists in that
+query's package. Images are decoded and validated before being sent as actual
+OpenAI image inputs. `MAX_IMAGE_INPUTS` (default `8`) bounds optional images;
+required exact-page images take priority and generation reports an error if
+the requested evidence exceeds the configured limit. Visual retrieval already
+limits repeated child tiles by parent, and includes an available parent image
+for interpreting a crop. Images omitted by the generation budget are described
+as omitted and are not represented as visually inspected.
+
+Numerical visual questions continue to use the deterministic structured-answer
+path when extraction supports the requested operation. Table records must be
+verified for calculation; chart values retain their extraction method and are
+labelled OCR-transcribed or estimated as applicable. Estimates are not silently
+promoted to measured source values. Unsupported or incomplete calculations
+fail closed. For visual questions, related structured records are attached
+when their source element or page is among the retrieved evidence. Qualitative
+answers receive retrieved evidence and must distinguish observations,
+extracted values, estimates, and interpretations. The tests mock
+generation and use synthetic assets; they do not validate paid model behavior
+or answer grounding on real documents. Real-document extraction accuracy and
+end-to-end model grounding remain unevaluated.
 
 ## Tests and verification
 

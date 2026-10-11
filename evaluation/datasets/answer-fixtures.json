@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "dataset_id": "paperlens-controlled-answer-checks-v1",
+  "annotation_notes": "Controlled answer strings exercise deterministic evaluator behavior. They are mocked fixture outputs, not model generations or real-document ground truth.",
+  "cases": [
+    {
+      "case_id": "answer-fixture-supported-fact",
+      "split": "test",
+      "category": "citation_and_fact",
+      "query": "What was the reported value?",
+      "source": {"kind": "synthetic_fixture", "fixture": "controlled answer string", "annotation_status": "fixture-labelled"},
+      "answer_evaluation": {
+        "execution_kind": "mocked_result",
+        "fixture_answer": "The reported amount was 12.5 million USD [E-0123456789].",
+        "expected": {
+          "required_facts": ["12.5 million USD"],
+          "forbidden_facts": ["measured exactly"],
+          "required_citations": ["[E-0123456789]"],
+          "available_evidence_ids": ["E-0123456789"],
+          "numeric": {"value": "12.5", "unit": "million USD", "tolerance": "0"},
+          "should_abstain": false
+        }
+      }
+    },
+    {
+      "case_id": "answer-fixture-insufficient-evidence",
+      "split": "test",
+      "category": "abstention",
+      "query": "What is the unavailable value?",
+      "source": {"kind": "synthetic_fixture", "fixture": "controlled answer string", "annotation_status": "fixture-labelled"},
+      "answer_evaluation": {
+        "execution_kind": "mocked_result",
+        "fixture_answer": "I cannot determine this from the available evidence.",
+        "expected": {
+          "required_facts": [],
+          "forbidden_facts": ["the value is 99"],
+          "required_citations": [],
+          "should_abstain": true
+        }
+      }
+    }
+  ]
+}

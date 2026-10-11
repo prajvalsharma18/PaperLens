@@ -59,11 +59,111 @@ def test_cli_help_for_root_and_commands(capsys):
         ["ingest", "--help"],
         ["query", "--help"],
         ["index-visuals", "--help"],
+        ["extract-data", "--help"],
     ):
         with pytest.raises(SystemExit) as exit_info:
             main.main(args)
         assert exit_info.value.code == 0
         assert "usage:" in capsys.readouterr().out
+
+
+def test_structured_numeric_query_uses_local_evidence_without_generation(
+    monkeypatch, capsys
+):
+    record = {
+        "kind": "table",
+        "status": "verified",
+        "data": {
+            "headers": ["Region", "Revenue"],
+            "header_rows": [0],
+            "rows": [["Region", "Revenue"], ["North", "9"], ["South", "12"]],
+        },
+        "document_id": "report-1",
+        "source_element_id": "table-1",
+        "source_file": "report.pdf",
+        "page": 2,
+        "extraction_method": "html_table_parser",
+    }
+    monkeypatch.setattr(
+        main, "load_document_manifest", lambda _document_id: {"document_id": "report-1"}
+    )
+    monkeypatch.setattr(main, "load_structured_evidence", lambda _document_id: [record])
+    validate = MagicMock(side_effect=AssertionError("configuration must not be required"))
+    generate = MagicMock(side_effect=AssertionError("generation must not be called"))
+    monkeypatch.setattr(main, "_validate_configuration", validate)
+    monkeypatch.setattr(main, "generate_answer", generate)
+
+    answer = main.query_documents(
+        "Which region had the highest revenue chart?", document_id="report-1"
+    )
+
+    assert answer is not None
+    assert "South: 12 Revenue" in answer
+    validate.assert_not_called()
+    generate.assert_not_called()
+    assert "Answer:" in capsys.readouterr().out
+
+
+def test_unsupported_numeric_visual_query_fails_closed_without_generation(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        main, "load_document_manifest", lambda _document_id: {"document_id": "report-1"}
+    )
+    monkeypatch.setattr(main, "load_structured_evidence", lambda _document_id: [])
+    validate = MagicMock(side_effect=AssertionError("configuration must not be required"))
+    generate = MagicMock(side_effect=AssertionError("generation must not be called"))
+    monkeypatch.setattr(main, "_validate_configuration", validate)
+    monkeypatch.setattr(main, "generate_answer", generate)
+
+    answer = main.query_documents(
+        "What is the exact value shown in the chart?", document_id="report-1"
+    )
+
+    assert answer is not None
+    assert "does not support an unambiguous calculation" in answer
+    validate.assert_not_called()
+    generate.assert_not_called()
+    assert "no values were inferred from appearance" in capsys.readouterr().out.lower()
+
+
+def test_exact_page_plan_does_not_use_structured_answer_shortcut(monkeypatch):
+    plan = main.create_query_plan("Which chart is shown on page 2?", "report-1")
+    assert plan.retrieval_strategy == "exact_page"
+
+    assert main._structured_numeric_answer("Which chart is shown on page 2?", plan) is None
+
+
+def test_related_structured_evidence_is_attached_with_extraction_provenance(monkeypatch):
+    record = {
+        "record_id": "record-1",
+        "kind": "chart",
+        "document_id": "report-1",
+        "source_element_id": "figure-1",
+        "source_file": "report.pdf",
+        "page": 3,
+        "extraction_method": "axis_digitization",
+        "status": "estimated",
+        "data": {"values": [{"category": "North", "value": "12"}]},
+        "warnings": ["estimated from chart pixels"],
+        "limitations": [],
+    }
+    monkeypatch.setattr(main, "load_structured_evidence", lambda _doc: [record])
+    plan = main.create_query_plan("Describe the chart on page 3", "report-1")
+    items = main._related_structured_evidence(
+        plan,
+        [{
+            "uuid": "figure-1",
+            "type": "Image",
+            "content": "",
+            "metadata": {"document_id": "report-1", "page": 3},
+        }],
+    )
+    assert len(items) == 1
+    assert items[0]["metadata"]["record_id"] == "record-1"
+    assert items[0]["metadata"]["quality_status"] == "estimated"
+    assert items[0]["metadata"]["extraction_method"] == "axis_digitization"
+    assert '"value": "12"' in items[0]["content"]
 
 
 @pytest.mark.parametrize(
@@ -297,15 +397,20 @@ def test_query_passes_retrieved_image_and_table_to_generation(
     retrieval.assert_called_once_with(
         "What is the revenue?", embedder, k=2, document_id="report-1"
     )
-    generated.assert_called_once_with("What is the revenue?", context)
+    generated.assert_called_once()
+    assert generated.call_args.args[0] == "What is the revenue?"
+    assert [item["metadata"]["evidence_id"] for item in generated.call_args.args[1]]
+    assert [item["uuid"] for item in generated.call_args.args[1]] == [
+        item["uuid"] for item in context
+    ]
     visual_search.assert_not_called()
     output = capsys.readouterr().out
     assert "report.pdf, page 3" in output
     assert "report.pdf, page 2" in output
-    assert "[document ID: report-1]" in output
+    assert "document ID: report-1" in output
 
 
-def test_numeric_visual_query_uses_semantic_retrieval_and_discloses_limit(
+def test_numeric_visual_query_without_structured_data_fails_closed(
     monkeypatch, capsys, valid_configuration
 ):
     chart = {
@@ -330,24 +435,16 @@ def test_numeric_visual_query_uses_semantic_retrieval_and_discloses_limit(
 
     answer = main.query_documents("What is the exact value of the tallest bar?")
 
-    assert answer == "The bar appears tallest."
+    assert answer is not None
+    assert "cannot provide a numerical answer" in answer
     retrieval.assert_called_once_with(
         "What is the exact value of the tallest bar?",
         "embedder",
         k=4,
         document_id=None,
     )
-    context = generated.call_args.args[1]
-    assert context[0] is chart
-    digitization_note = next(
-        item for item in context if "digitization is not implemented" in item["content"]
-    )
-    assert digitization_note["metadata"] == {
-        "query_intent": "numeric_visual_question",
-        "chart_digitization_desirable": True,
-    }
-    assert any("there is no region detector" in item["content"] for item in context)
-    assert "Visual index is unavailable or empty" in capsys.readouterr().err
+    generated.assert_not_called()
+    assert "no values were inferred from appearance" in capsys.readouterr().out.lower()
 
 
 def test_index_visuals_cli_does_not_require_openai_credentials(
@@ -491,7 +588,8 @@ def test_visual_query_keeps_semantic_match_when_visual_asset_disappears(
     assert main.query_documents("What does the chart show?") == (
         "The title introduces a chart."
     )
-    assert generated.call_args.args[1][0] == semantic
+    assert generated.call_args.args[1][0]["uuid"] == semantic["uuid"]
+    assert generated.call_args.args[1][0]["content"] == semantic["content"]
     assert "Visual evidence assets are unavailable" in capsys.readouterr().err
 
 
@@ -517,7 +615,8 @@ def test_query_warns_on_missing_raw_element_and_invalid_image_path_with_summary(
     assert main.query_documents("Summarize the chart.") == "Answer"
 
     generation_context = generated.call_args.args[1]
-    assert generation_context[0] is image
+    assert generation_context[0]["uuid"] == image["uuid"]
+    assert generation_context[0]["metadata"]["evidence_id"].startswith("E-")
     assert any("whole-image evidence" in item["content"] for item in generation_context[1:])
     error_output = capsys.readouterr().err
     assert "original Image 'image-id' is unavailable" in error_output

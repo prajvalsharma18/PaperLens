@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "dataset_id": "paperlens-synthetic-extraction-v1",
+  "annotation_notes": "Expected values are explicitly labelled for the generated deterministic fixtures. They are synthetic geometry/parser checks, not human annotation of a PDF.",
+  "cases": [
+    {
+      "case_id": "table-verified-html",
+      "split": "test",
+      "category": "table",
+      "query": "Extract the table cells.",
+      "source": {"kind": "synthetic_fixture", "fixture": "generated HTML table", "annotation_status": "controlled-ground-truth"},
+      "extraction_evaluation": {
+        "kind": "table",
+        "source_element_id": "benchmark-table",
+        "page": 1,
+        "expected_status": "verified",
+        "expected_rows": [["Category", "Value"], ["A", "10"], ["B", "20"]]
+      }
+    },
+    {
+      "case_id": "table-incomplete-text",
+      "split": "test",
+      "category": "table",
+      "query": "Extract this delimited table.",
+      "source": {"kind": "synthetic_fixture", "fixture": "generated plain-text table", "annotation_status": "controlled-ground-truth"},
+      "extraction_evaluation": {
+        "kind": "table",
+        "source_element_id": "benchmark-incomplete-table",
+        "page": 3,
+        "expected_status": "incomplete"
+      }
+    },
+    {
+      "case_id": "chart-estimated-bars",
+      "split": "test",
+      "category": "chart",
+      "query": "Associate bars with their categories and values.",
+      "source": {"kind": "synthetic_fixture", "fixture": "generated vertical bars and OCR boxes", "annotation_status": "controlled-ground-truth"},
+      "extraction_evaluation": {
+        "kind": "chart",
+        "source_element_id": "benchmark-chart",
+        "page": 2,
+        "expected_status": "estimated",
+        "expected_values": {"A": 5.0, "B": 8.333333333333334},
+        "numeric_tolerance": 0.1,
+        "tolerance_note": "Pixel geometry fixture tolerance; does not make estimated chart values exact."
+      }
+    },
+    {
+      "case_id": "chart-unsupported",
+      "split": "test",
+      "category": "chart",
+      "query": "Extract the unsupported line chart.",
+      "source": {"kind": "synthetic_fixture", "fixture": "untyped line chart record", "annotation_status": "controlled-ground-truth"},
+      "extraction_evaluation": {
+        "kind": "chart",
+        "source_element_id": "benchmark-unsupported-chart",
+        "page": 4,
+        "expected_status": "unsupported"
+      }
+    }
+  ]
+}

@@ -40,7 +40,8 @@ _VISUAL_TERMS = re.compile(
 )
 _NUMERIC_VISUAL_TERMS = re.compile(
     r"\b(exact|value|values|number|amount|how many|tallest|highest|"
-    r"lowest|shortest|numeric|numerical|percentage|percent)\b",
+    r"lowest|shortest|numeric|numerical|percentage|percent|compare|comparison|"
+    r"difference|delta|calculation|calculate|computed|sum|total)\b",
     re.IGNORECASE,
 )
 _COMPARISON_TERMS = re.compile(

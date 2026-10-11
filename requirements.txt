@@ -29,5 +29,8 @@ numpy
 fastapi
 uvicorn[standard]
 
+# --- Frontend ---
+streamlit>=1.65,<2.0
+
 # --- Testing ---
 pytest

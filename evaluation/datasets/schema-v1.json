@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PaperLens labelled evaluation dataset",
+  "type": "object",
+  "required": ["schema_version", "dataset_id", "cases"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "dataset_id": {"type": "string", "minLength": 1},
+    "annotation_notes": {"type": "string"},
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["case_id", "split", "category", "query", "source"],
+        "properties": {
+          "case_id": {"type": "string", "minLength": 1},
+          "split": {"type": "string", "minLength": 1},
+          "category": {"type": "string", "minLength": 1},
+          "query": {"type": "string", "minLength": 1},
+          "query_intent": {"type": "string"},
+          "source": {
+            "type": "object",
+            "required": ["kind", "annotation_status"],
+            "properties": {
+              "kind": {"enum": ["real_document", "synthetic_fixture", "mocked_result"]},
+              "document_id": {"type": "string"},
+              "fixture": {"type": "string"},
+              "annotation_status": {"type": "string"}
+            }
+          },
+          "retrieval_evaluation": {"type": "boolean"},
+          "generation_evaluation": {"type": "object"},
+          "relevant_evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "granularity", "annotation"],
+              "properties": {
+                "id": {"type": "string"},
+                "granularity": {"enum": ["page", "figure", "element", "region", "chunk"]},
+                "relevance": {"type": "integer", "minimum": 0},
+                "annotation": {"type": "string"}
+              }
+            }
+          },
+          "expected_answer": {"type": "object"},
+          "answer_evaluation": {"type": "object"},
+          "extraction_evaluation": {"type": "object"}
+        }
+      }
+    }
+  }
+}

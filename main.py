@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import sys
 import uuid
@@ -16,7 +17,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from generation.rag_chain import generate_answer
+from generation.evidence_builder import build_evidence_package, format_source_citations
 from ingestion.assets import resolve_asset_path
+from ingestion.data_extractor import extract_document_data
 from ingestion.image_summariser import summarise_images
 from ingestion.ocr import OcrError, ocr_image
 from ingestion.partitioner import make_element_uuid, partition_pdf
@@ -31,6 +34,7 @@ from retrieval.document_store import (
     list_document_manifests,
     load_document_manifest,
     load_page_elements,
+    load_structured_evidence,
     save_document_manifest,
     save_raw_element,
 )
@@ -527,22 +531,7 @@ def _check_query_collection() -> None:
 
 
 def _source_citations(context: list[dict[str, Any]]) -> list[str]:
-    citations = []
-    for element in context:
-        metadata = element.get("metadata", {})
-        source = metadata.get("source")
-        page = metadata.get("page")
-        document_id = metadata.get("document_id")
-        if not source and not document_id:
-            continue
-        label = source or f"document {document_id}"
-        if page is not None:
-            label += f", page {page}"
-        if document_id:
-            label += f" [document ID: {document_id}]"
-        if label not in citations:
-            citations.append(label)
-    return citations
+    return format_source_citations(build_evidence_package(context))
 
 
 def _resolve_page_document(plan: QueryPlan) -> tuple[str, dict[str, Any]]:
@@ -591,9 +580,11 @@ def _query_guidance(plan: QueryPlan) -> list[dict[str, Any]]:
                     "chart_digitization_desirable": True,
                 },
                 "content": (
-                    "Numerical chart digitization is not implemented. Do not claim "
-                    "values were extracted or computed; qualify visual estimates and "
-                    "say when an exact value cannot be determined."
+                    "Use only structured values explicitly present in the retrieved "
+                    "evidence. Distinguish verified table cells, OCR-transcribed "
+                    "labels, and estimated chart values. Do not infer missing values "
+                    "from visual appearance; state when the requested calculation "
+                    "cannot be supported."
                 ),
             }
         )
@@ -611,6 +602,60 @@ def _query_guidance(plan: QueryPlan) -> list[dict[str, Any]]:
             }
         )
     return guidance
+
+
+def _structured_numeric_answer(
+    question: str,
+    plan: QueryPlan,
+) -> str | None:
+    if not plan.chart_digitization_desirable or plan.retrieval_strategy == "exact_page":
+        return None
+    try:
+        if plan.document_id:
+            manifest = load_document_manifest(plan.document_id)
+            if (
+                manifest is not None
+                and manifest.get("document_id") != plan.document_id
+            ):
+                raise PaperLensError(
+                    "The provenance manifest does not match the requested document ID."
+                )
+            manifests = [manifest] if manifest else []
+        else:
+            manifests = list_document_manifests()
+        if len(manifests) > 1:
+            raise PaperLensError(
+                "A numerical visual question is ambiguous across multiple documents. "
+                "Specify --document-id."
+            )
+    except (OSError, ValueError) as exc:
+        raise PaperLensError(f"Could not read structured evidence: {exc}") from exc
+
+    if not manifests:
+        return None
+    if len(manifests) != 1:
+        raise PaperLensError(
+            "A numerical visual question is ambiguous across multiple documents. "
+            "Specify --document-id."
+        )
+    document_id = manifests[0].get("document_id")
+    if not document_id:
+        return None
+    try:
+        records = load_structured_evidence(str(document_id))
+    except (OSError, ValueError) as exc:
+        raise PaperLensError(f"Could not load structured evidence: {exc}") from exc
+    from retrieval.structured_answers import answer_from_structured_data
+
+    answer = answer_from_structured_data(question, records)
+    if answer is not None:
+        return answer
+    return (
+        "I cannot provide a numerical answer because the available structured "
+        "evidence does not support an unambiguous calculation. Run "
+        f"`PaperLens extract-data --document-id {document_id}` and verify the "
+        "table or chart extraction; no values were inferred from appearance."
+    )
 
 
 def _page_evidence(plan: QueryPlan) -> list[dict[str, Any]]:
@@ -837,6 +882,77 @@ def _visual_evidence_limit() -> int:
     return limit
 
 
+def _related_structured_evidence(
+    plan: QueryPlan,
+    context: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach chart/table records only when their source element or page is present."""
+    element_ids: set[str] = set()
+    pages_by_document: dict[str, set[int]] = {}
+    documents: set[str] = set()
+    for item in context:
+        metadata = item.get("metadata", {})
+        document_id = metadata.get("document_id")
+        if not document_id:
+            continue
+        document_id = str(document_id)
+        documents.add(document_id)
+        if metadata.get("page") is not None:
+            pages_by_document.setdefault(document_id, set()).add(metadata["page"])
+        for identity in (
+            item.get("uuid"), metadata.get("element_id"), metadata.get("parent_id")
+        ):
+            if identity:
+                element_ids.add(str(identity))
+    if plan.document_id:
+        documents.add(plan.document_id)
+
+    existing = {
+        str(item.get("metadata", {}).get("record_id"))
+        for item in context
+        if item.get("metadata", {}).get("record_id")
+    }
+    related: list[dict[str, Any]] = []
+    for document_id in sorted(documents):
+        try:
+            records = load_structured_evidence(document_id)
+        except (OSError, ValueError) as exc:
+            raise PaperLensError(
+                f"Could not load structured evidence for document {document_id!r}: {exc}"
+            ) from exc
+        for record in records:
+            record_id = str(record.get("record_id", ""))
+            if record_id in existing:
+                continue
+            if (
+                str(record.get("source_element_id", "")) not in element_ids
+                and record.get("page") not in pages_by_document.get(document_id, set())
+            ):
+                continue
+            metadata = {
+                "document_id": document_id,
+                "source": record.get("source_file"),
+                "source_file": record.get("source_file"),
+                "page": record.get("page"),
+                "element_id": record.get("source_element_id"),
+                "record_id": record_id,
+                "extraction_method": record.get("extraction_method"),
+                "quality_status": record.get("status"),
+                "warnings": record.get("warnings", []),
+                "limitations": record.get("limitations", []),
+                "evidence_type": f"structured_{record.get('kind')}",
+            }
+            related.append(
+                {
+                    "uuid": record_id,
+                    "type": "StructuredEvidence",
+                    "content": json.dumps(record, ensure_ascii=False, allow_nan=False),
+                    "metadata": metadata,
+                }
+            )
+    return related
+
+
 def query_documents(
     question: str,
     document_id: str | None = None,
@@ -852,6 +968,11 @@ def query_documents(
         plan = create_query_plan(question, document_id=document_id)
     except QueryRoutingError as exc:
         raise PaperLensError(str(exc)) from exc
+    answer = _structured_numeric_answer(question, plan)
+    if answer is not None:
+        print("Answer:")
+        print(answer)
+        return answer
     _validate_configuration()
 
     if plan.retrieval_strategy == "exact_page":
@@ -923,6 +1044,22 @@ def query_documents(
                         context = semantic_context
         context.extend(_query_guidance(plan))
 
+    if plan.visual_question:
+        context.extend(_related_structured_evidence(plan, context))
+
+    if (
+        plan.chart_digitization_desirable
+        and plan.retrieval_strategy != "exact_page"
+    ):
+        answer = (
+            "I cannot provide a numerical answer because the available structured "
+            "evidence does not support an unambiguous calculation. No values were "
+            "inferred from appearance."
+        )
+        print("Answer:")
+        print(answer)
+        return answer
+
     if not context:
         print("No matching indexed elements were found.")
         return None
@@ -954,6 +1091,7 @@ def query_documents(
                 f"Retrieved table {element.get('uuid', '')!r} has no available content."
             )
 
+    context = build_evidence_package(context)
     try:
         answer = generate_answer(question, context)
     except Exception as exc:
@@ -1099,6 +1237,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=16,
         help="Number of visual assets per model inference batch (default: 16).",
     )
+
+    extract_parser = commands.add_parser(
+        "extract-data",
+        help="Extract local table and explicitly tagged bar-chart evidence.",
+    )
+    extract_parser.add_argument(
+        "--document-id",
+        required=True,
+        help="Document ID printed by the ingest command.",
+    )
     return parser
 
 
@@ -1122,8 +1270,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "query":
             query_documents(args.question, document_id=args.document_id, k=args.k)
-        else:
+        elif args.command == "index-visuals":
             index_visuals(args.document_id, batch_size=args.batch_size)
+        else:
+            try:
+                report = extract_document_data(args.document_id)
+            except (OSError, ValueError) as exc:
+                raise PaperLensError(f"Structured extraction failed: {exc}") from exc
+            print(f"Document ID: {args.document_id}")
+            print(f"Structured records: {len(report.records)}")
+            for status, count in sorted(report.status_counts.items()):
+                print(f"  {status}: {count}")
+            for record in report.records:
+                if record.get("status") in {"incomplete", "unreadable", "unsupported"}:
+                    details = "; ".join(record.get("warnings", []))
+                    print(
+                        f"{record['status']}: {record['source_element_id']}: {details}",
+                        file=sys.stderr,
+                    )
+            for failure in report.failures:
+                print(f"Error: {failure}", file=sys.stderr)
+            if report.failures:
+                return 1
     except PaperLensError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

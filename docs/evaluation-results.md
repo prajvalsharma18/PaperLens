@@ -1,25 +1,18 @@
-# Evaluation Results
+# Evaluation results
 
-This file tracks RAGAS scores after running the benchmark script.
+Evaluation runs write timestamped JSON reports and Markdown summaries under
+\`evaluation/reports/\`. See [the dataset annotation guide](../evaluation/datasets/README.md)
+and [the README evaluation section](../README.md#reproducible-evaluation-runner)
+for the runner and metric definitions.
 
-## How to Run
+The repository currently includes controlled answer strings and generated
+table/chart fixtures. They exercise metric and runner behavior; they are not
+manually labelled real-document ground truth. No local PDFs were found in the
+repository, so real-document retrieval, extraction accuracy, and answer
+grounding remain unevaluated. Do not interpret synthetic scores as general
+accuracy.
 
-```bash
-python evaluation/benchmark.py --dataset data/eval_dataset.json
-```
-
-## Results
-
-> Fill in after running the benchmark on your document set.
-
-| Metric | Multimodal RAG | Text-Only RAG | Delta |
-|---|---|---|---|
-| Faithfulness | — | — | — |
-| Answer Relevancy | — | — | — |
-| Context Precision | — | — | — |
-
-## Notes
-
-- Document set used: *(describe your test PDFs here)*
-- Number of eval questions: —
-- Date run: —
+The previous \`evaluation/benchmark.py\` RAGAS workflow invoked model generation
+and RAGAS against a single already-retrieved context. That did not compare
+retrievers. RAGAS remains available as a separate optional evaluator and is not
+run by the offline benchmark.

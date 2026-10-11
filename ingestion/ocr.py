@@ -47,6 +47,7 @@ def ocr_image(image_path: str, page_number: int, language: str = "eng") -> dict[
 
     words: list[str] = []
     boxes: list[tuple[int, int, int, int]] = []
+    tokens: list[dict[str, Any]] = []
     try:
         for row in csv.DictReader(io.StringIO(result.stdout), delimiter="\t"):
             text = (row.get("text") or "").strip()
@@ -59,7 +60,9 @@ def ocr_image(image_path: str, page_number: int, language: str = "eng") -> dict[
             if width <= 0 or height <= 0:
                 continue
             words.append(text)
-            boxes.append((left, top, left + width, top + height))
+            box = (left, top, left + width, top + height)
+            boxes.append(box)
+            tokens.append({"text": text, "bbox": list(box)})
     except (KeyError, TypeError, ValueError) as exc:
         raise OcrError(f"Tesseract returned invalid box data for page {page_number}.") from exc
 
@@ -75,6 +78,7 @@ def ocr_image(image_path: str, page_number: int, language: str = "eng") -> dict[
     ]
     return {
         "text": text,
+        "tokens": tokens,
         "page_number": page_number,
         "bbox": bbox,
         "page_width": image_width,

@@ -21,6 +21,12 @@ qdrant_storage/
 # Evaluation outputs
 *.json
 !data/eval_dataset.json
+!evaluation/
+!evaluation/datasets/
+!evaluation/datasets/*.json
+!evaluation/reports/
+!evaluation/reports/*.json
+!evaluation/reports/*.md
 
 # OS
 .DS_Store

@@ -34,6 +34,10 @@ def test_ocr_returns_text_page_and_pixel_bounding_box(tmp_path):
 
     assert result == {
         "text": "Annual Report",
+        "tokens": [
+            {"text": "Annual", "bbox": [10, 5, 40, 13]},
+            {"text": "Report", "bbox": [45, 5, 80, 13]},
+        ],
         "page_number": 2,
         "bbox": [10, 5, 80, 13],
         "page_width": 100,
