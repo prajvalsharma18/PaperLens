@@ -109,3 +109,11 @@ def test_upsert_preserves_element_uuid_type_and_document_metadata(monkeypatch):
         "uuid": "element-uuid",
         "type": "Table",
     }
+    ids = store.add_documents.call_args.kwargs["ids"]
+    assert len(ids) == 1
+    assert len(ids[0]) == 36
+    from retrieval.vector_store import upsert_documents
+
+    upsert_documents([element], embedder)
+    assert store.add_documents.call_count == 2
+    assert store.add_documents.call_args.kwargs["ids"] == ids

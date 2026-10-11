@@ -49,10 +49,17 @@ def valid_configuration(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("QDRANT_URL", "http://qdrant.test:6333")
     monkeypatch.setenv("DOC_STORE_PATH", str(tmp_path / "doc_store"))
+    monkeypatch.setattr(main, "render_pdf_pages", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "save_document_manifest", lambda *args, **kwargs: None)
 
 
 def test_cli_help_for_root_and_commands(capsys):
-    for args in (["--help"], ["ingest", "--help"], ["query", "--help"]):
+    for args in (
+        ["--help"],
+        ["ingest", "--help"],
+        ["query", "--help"],
+        ["index-visuals", "--help"],
+    ):
         with pytest.raises(SystemExit) as exit_info:
             main.main(args)
         assert exit_info.value.code == 0
@@ -96,6 +103,12 @@ def test_ingest_rejects_missing_credentials_before_qdrant_or_paid_calls(
     main.partition_pdf.assert_not_called()
 
 
+def test_query_cli_reports_invalid_page_range_without_service_access(capsys):
+    assert main.main(["query", "Compare pages 4-2."]) == 1
+
+    assert "Error: Invalid descending page range 4-2." in capsys.readouterr().err
+
+
 def test_ingest_indexes_search_text_and_saves_same_original_elements(
     tmp_path, monkeypatch, capsys, valid_configuration
 ):
@@ -108,7 +121,9 @@ def test_ingest_indexes_search_text_and_saves_same_original_elements(
     indexed = {}
     monkeypatch.setattr(main, "get_embedder", lambda: embedder)
     monkeypatch.setattr(main, "get_vector_store", MagicMock())
-    monkeypatch.setattr(main, "partition_pdf", lambda path: elements)
+    monkeypatch.setattr(
+        main, "partition_pdf", lambda path, document_id=None: elements
+    )
     monkeypatch.setattr(
         main,
         "summarise_images",
@@ -166,7 +181,7 @@ def test_ingest_surfaces_partition_and_index_errors(tmp_path, monkeypatch, valid
         main.ingest_pdf(str(_write_pdf(tmp_path)))
 
     monkeypatch.setattr(
-        main, "partition_pdf", lambda path: [
+        main,         "partition_pdf", lambda path, document_id=None: [
             {
                 "uuid": "text-id",
                 "type": "NarrativeText",
@@ -192,7 +207,7 @@ def test_ingest_counts_and_reports_unsupported_elements(
     monkeypatch.setattr(
         main,
         "partition_pdf",
-        lambda path: [
+        lambda path, document_id=None: [
             {
                 "uuid": "text-id",
                 "type": "NarrativeText",
@@ -269,6 +284,8 @@ def test_query_passes_retrieved_image_and_table_to_generation(
     monkeypatch.setattr(main, "_check_query_collection", MagicMock())
     monkeypatch.setattr(main, "get_embedder", lambda: embedder)
     monkeypatch.setattr(main, "retrieve", retrieval)
+    visual_search = MagicMock()
+    monkeypatch.setattr(main, "search_visual_assets", visual_search)
     monkeypatch.setattr(main, "generate_answer", generated)
     monkeypatch.setattr(main.Path, "is_file", lambda self: str(self) == "chart.png")
 
@@ -281,10 +298,201 @@ def test_query_passes_retrieved_image_and_table_to_generation(
         "What is the revenue?", embedder, k=2, document_id="report-1"
     )
     generated.assert_called_once_with("What is the revenue?", context)
+    visual_search.assert_not_called()
     output = capsys.readouterr().out
     assert "report.pdf, page 3" in output
     assert "report.pdf, page 2" in output
     assert "[document ID: report-1]" in output
+
+
+def test_numeric_visual_query_uses_semantic_retrieval_and_discloses_limit(
+    monkeypatch, capsys, valid_configuration
+):
+    chart = {
+        "uuid": "chart-id",
+        "type": "Image",
+        "content": "",
+        "vision_summary": "A chart with a tall red bar.",
+        "metadata": {
+            "document_id": "report",
+            "page": 5,
+            "image_path": "chart.png",
+        },
+    }
+    monkeypatch.setattr(main, "_check_query_collection", lambda: None)
+    monkeypatch.setattr(main, "get_embedder", lambda: "embedder")
+    retrieval = MagicMock(return_value=[chart])
+    monkeypatch.setattr(main, "retrieve", retrieval)
+    monkeypatch.setattr(main, "search_visual_assets", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main.Path, "is_file", lambda self: str(self) == "chart.png")
+    generated = MagicMock(return_value="The bar appears tallest.")
+    monkeypatch.setattr(main, "generate_answer", generated)
+
+    answer = main.query_documents("What is the exact value of the tallest bar?")
+
+    assert answer == "The bar appears tallest."
+    retrieval.assert_called_once_with(
+        "What is the exact value of the tallest bar?",
+        "embedder",
+        k=4,
+        document_id=None,
+    )
+    context = generated.call_args.args[1]
+    assert context[0] is chart
+    digitization_note = next(
+        item for item in context if "digitization is not implemented" in item["content"]
+    )
+    assert digitization_note["metadata"] == {
+        "query_intent": "numeric_visual_question",
+        "chart_digitization_desirable": True,
+    }
+    assert any("there is no region detector" in item["content"] for item in context)
+    assert "Visual index is unavailable or empty" in capsys.readouterr().err
+
+
+def test_index_visuals_cli_does_not_require_openai_credentials(
+    monkeypatch, capsys, valid_configuration
+):
+    from retrieval.visual_indexer import VisualIndexResult
+
+    monkeypatch.delenv("OPENAI_API_KEY")
+    indexed = MagicMock(
+        return_value=VisualIndexResult(
+            parents_indexed=2,
+            page_images_indexed=1,
+            tiles_indexed=3,
+            skipped_assets=0,
+            skip_reasons={},
+            model_name="openai/clip-vit-base-patch32",
+            vector_dimension=512,
+        )
+    )
+    monkeypatch.setattr(main, "index_document_visual_assets", indexed)
+
+    assert main.main(
+        ["index-visuals", "--document-id", "report", "--batch-size", "8"]
+    ) == 0
+
+    indexed.assert_called_once_with("report", batch_size=8)
+    output = capsys.readouterr().out
+    assert "Visual vector dimension: 512" in output
+    assert "Visual child tiles upserted: 3" in output
+
+
+def test_visual_query_fuses_text_and_visual_evidence_with_parent_context(
+    tmp_path, monkeypatch, capsys, valid_configuration
+):
+    from PIL import Image
+
+    crop_path = tmp_path / "chart-crop.png"
+    store_path = tmp_path / "document-store"
+    parent_path = store_path / "assets" / "report" / "chart-parent.png"
+    Image.new("RGB", (12, 8), "red").save(crop_path)
+    parent_path.parent.mkdir(parents=True)
+    Image.new("RGB", (24, 16), "white").save(parent_path)
+    monkeypatch.setenv("DOC_STORE_PATH", str(store_path))
+    text_title = {
+        "uuid": "title-id",
+        "type": "Title",
+        "content": "Quarterly revenue comparison",
+        "metadata": {"document_id": "report", "page": 2},
+    }
+    text_parent = {
+        "uuid": "figure-1",
+        "type": "Image",
+        "content": "",
+        "vision_summary": "A quarterly revenue chart.",
+        "metadata": {
+            "document_id": "report",
+            "page": 2,
+            "image_path": str(parent_path),
+        },
+    }
+    visual_tile = {
+        "uuid": "tile-1",
+        "type": "Image",
+        "content": "",
+        "metadata": {
+            "document_id": "report",
+            "page_number": 2,
+            "image_path": str(crop_path),
+            "parent_asset_path": "assets/report/chart-parent.png",
+            "parent_id": "figure-1",
+            "root_source_id": "figure-1",
+            "chunk_type": "image_tile",
+            "bbox": [0, 0, 12, 8],
+            "bbox_coordinate_system": "parent_pixels",
+        },
+    }
+    monkeypatch.setattr(main, "_check_query_collection", lambda: None)
+    monkeypatch.setattr(main, "get_embedder", lambda: "text-embedder")
+    monkeypatch.setattr(
+        main, "retrieve", lambda *args, **kwargs: [text_title, text_parent]
+    )
+    visual_search = MagicMock(return_value=[visual_tile])
+    monkeypatch.setattr(main, "search_visual_assets", visual_search)
+    generated = MagicMock(return_value="The chart compares quarterly revenue.")
+    monkeypatch.setattr(main, "generate_answer", generated)
+
+    answer = main.query_documents(
+        "What does the chart show?", document_id="report", k=2
+    )
+
+    assert answer == "The chart compares quarterly revenue."
+    visual_search.assert_called_once_with(
+        "What does the chart show?", limit=12, document_id="report"
+    )
+    context = generated.call_args.args[1]
+    assert any(item["uuid"] == "title-id" for item in context)
+    tile = next(item for item in context if item["uuid"] == "tile-1")
+    assert tile["metadata"]["evidence_type"] == "visual_child_crop"
+    assert "relative to its parent image" in tile["metadata"]["evidence_label"]
+    assert sum(
+        item.get("metadata", {}).get("image_path") in {
+            str(parent_path),
+            "assets/report/chart-parent.png",
+        }
+        for item in context
+    ) == 1
+    assert not any(
+        item["metadata"].get("evidence_type") == "visual_parent_context"
+        for item in context
+    )
+    assert capsys.readouterr().err == ""
+
+
+def test_visual_query_keeps_semantic_match_when_visual_asset_disappears(
+    tmp_path, monkeypatch, capsys, valid_configuration
+):
+    semantic = {
+        "uuid": "shared-id",
+        "type": "Title",
+        "content": "A chart is introduced here.",
+        "metadata": {"document_id": "report", "page": 1},
+    }
+    visual = {
+        "uuid": "shared-id",
+        "type": "Image",
+        "content": "",
+        "metadata": {
+            "document_id": "report",
+            "page": 1,
+            "image_path": str(tmp_path / "removed-crop.png"),
+            "chunk_type": "figure",
+        },
+    }
+    monkeypatch.setattr(main, "_check_query_collection", lambda: None)
+    monkeypatch.setattr(main, "get_embedder", lambda: "text-embedder")
+    monkeypatch.setattr(main, "retrieve", lambda *args, **kwargs: [semantic])
+    monkeypatch.setattr(main, "search_visual_assets", lambda *args, **kwargs: [visual])
+    generated = MagicMock(return_value="The title introduces a chart.")
+    monkeypatch.setattr(main, "generate_answer", generated)
+
+    assert main.query_documents("What does the chart show?") == (
+        "The title introduces a chart."
+    )
+    assert generated.call_args.args[1][0] == semantic
+    assert "Visual evidence assets are unavailable" in capsys.readouterr().err
 
 
 def test_query_warns_on_missing_raw_element_and_invalid_image_path_with_summary(
@@ -301,13 +509,16 @@ def test_query_warns_on_missing_raw_element_and_invalid_image_path_with_summary(
     monkeypatch.setattr(main, "_check_query_collection", lambda: None)
     monkeypatch.setattr(main, "get_embedder", lambda: MagicMock())
     monkeypatch.setattr(main, "retrieve", lambda *args, **kwargs: [image])
+    monkeypatch.setattr(main, "search_visual_assets", lambda *args, **kwargs: [])
     generated = MagicMock(return_value="Answer")
     monkeypatch.setattr(main, "generate_answer", generated)
     monkeypatch.setattr(main.Path, "is_file", lambda self: False)
 
     assert main.query_documents("Summarize the chart.") == "Answer"
 
-    generated.assert_called_once_with("Summarize the chart.", [image])
+    generation_context = generated.call_args.args[1]
+    assert generation_context[0] is image
+    assert any("whole-image evidence" in item["content"] for item in generation_context[1:])
     error_output = capsys.readouterr().err
     assert "original Image 'image-id' is unavailable" in error_output
     assert "image 'image-id' is unavailable" in error_output
@@ -325,6 +536,7 @@ def test_query_fails_clearly_for_image_without_file_or_summary(
     monkeypatch.setattr(main, "_check_query_collection", lambda: None)
     monkeypatch.setattr(main, "get_embedder", lambda: MagicMock())
     monkeypatch.setattr(main, "retrieve", lambda *args, **kwargs: [image])
+    monkeypatch.setattr(main, "search_visual_assets", lambda *args, **kwargs: [])
     monkeypatch.setattr(main.Path, "is_file", lambda self: False)
     generated = MagicMock()
     monkeypatch.setattr(main, "generate_answer", generated)
@@ -404,3 +616,531 @@ def test_cli_reports_actionable_errors_without_traceback(tmp_path, monkeypatch, 
     error_output = capsys.readouterr().err
     assert "OPENAI_API_KEY is missing" in error_output
     assert "Traceback" not in error_output
+
+
+def test_default_document_id_is_stable_per_path_and_content(tmp_path):
+    from main import _default_document_id
+
+    first_source = tmp_path / "first" / "report.pdf"
+    second_source = tmp_path / "second" / "report.pdf"
+    first_source.parent.mkdir()
+    second_source.parent.mkdir()
+    first_source.write_bytes(b"%PDF-1.7\nsame content")
+    second_source.write_bytes(b"%PDF-1.7\nsame content")
+
+    assert _default_document_id(first_source) == _default_document_id(first_source)
+    assert _default_document_id(first_source) != _default_document_id(second_source)
+    first_source.write_bytes(b"%PDF-1.7\nupdated content")
+    assert _default_document_id(first_source) != _default_document_id(second_source)
+
+
+def test_page_images_are_indexed_only_when_requested_and_not_duplicated(
+    tmp_path, monkeypatch, valid_configuration
+):
+    from PIL import Image
+
+    pdf_path = _write_pdf(tmp_path)
+    extracted_image = tmp_path / "figure.png"
+    Image.new("RGB", (8, 8), "blue").save(extracted_image)
+    page_store = tmp_path / "doc_store" / "assets" / "pages"
+    page_store.mkdir(parents=True)
+    page_one = page_store / "page-00001.png"
+    page_two = page_store / "page-00002.png"
+    Image.new("RGB", (8, 8), "white").save(page_one)
+    Image.new("RGB", (8, 8), "white").save(page_two)
+    monkeypatch.setattr(main, "get_embedder", lambda: MagicMock())
+    monkeypatch.setattr(main, "get_vector_store", lambda embedder: object())
+    monkeypatch.setattr(
+        main,
+        "partition_pdf",
+        lambda path, document_id=None: [
+            {
+                "uuid": "figure-id",
+                "type": "Image",
+                "content": "",
+                "metadata": {
+                    "page": 1,
+                    "image_path": str(extracted_image),
+                },
+            },
+            {
+                "uuid": "text-id",
+                "type": "Title",
+                "content": "Scanned appendix",
+                "metadata": {"page": 2},
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "render_pdf_pages",
+        lambda *args, **kwargs: [
+            {
+                "page_number": page_number,
+                "image_path": f"assets/pages/page-{page_number:05}.png",
+                "pixel_width": 8,
+                "pixel_height": 8,
+                "page_width": 8,
+                "page_height": 8,
+                "coordinate_system": {"origin": "top-left", "units": "pixels"},
+                "rendering": {"library": "pypdfium2", "scale": 1},
+            }
+            for page_number in (1, 2)
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "summarise_images",
+        lambda images: [{**image, "embed_content": "Figure summary"} for image in images],
+    )
+    saved = []
+    indexed = {}
+    monkeypatch.setattr(main, "save_raw_element", saved.append)
+    monkeypatch.setattr(
+        main,
+        "upsert_documents",
+        lambda documents, embedder: indexed.update(documents=documents),
+    )
+
+    assert main.ingest_pdf(str(pdf_path), include_page_images=True) == 3
+
+    images = [item for item in indexed["documents"] if item["type"] == "Image"]
+    assert [item["metadata"]["page"] for item in images] == [1, 2]
+    page_fallback = next(item for item in images if item["metadata"]["page"] == 2)
+    assert page_fallback["metadata"]["extraction_method"] == "pypdfium2_page_render"
+    assert page_fallback["metadata"]["page_image_path"] == page_fallback["metadata"]["image_path"]
+    assert all(item["metadata"]["document_id"] for item in saved)
+
+
+def test_visual_chunking_is_opt_in_and_tiles_stay_out_of_the_vector_index(
+    tmp_path, monkeypatch, capsys, valid_configuration
+):
+    from PIL import Image
+
+    from retrieval.document_store import (
+        load_document_manifest,
+        save_document_manifest,
+    )
+
+    pdf_path = _write_pdf(tmp_path)
+    image_path = tmp_path / "large figure.png"
+    Image.new("RGB", (90, 60), "blue").save(image_path)
+    elements = [
+        {
+            "uuid": "figure-id",
+            "type": "Image",
+            "content": "",
+            "metadata": {"page": 1, "image_path": str(image_path)},
+        },
+        {
+            "uuid": "text-id",
+            "type": "NarrativeText",
+            "content": "A report paragraph",
+            "metadata": {"page": 1},
+        },
+    ]
+    monkeypatch.setattr(main, "get_embedder", lambda: MagicMock())
+    monkeypatch.setattr(main, "get_vector_store", lambda embedder: object())
+    monkeypatch.setattr(main, "partition_pdf", lambda path, document_id=None: elements)
+    monkeypatch.setattr(main, "render_pdf_pages", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        main,
+        "summarise_images",
+        lambda images: [
+            {**image, "embed_content": "Figure summary"} for image in images
+        ],
+    )
+    indexed = {}
+    saved = []
+    monkeypatch.setattr(main, "upsert_documents", lambda docs, _: indexed.update(docs=docs))
+    monkeypatch.setattr(main, "save_raw_element", saved.append)
+    monkeypatch.setattr(main, "save_document_manifest", save_document_manifest)
+    monkeypatch.setattr(main, "load_document_manifest", load_document_manifest)
+    save_document_manifest(
+        "report-visuals", {"document_id": "report-visuals", "visual_chunks": [{"uuid": "old"}]}
+    )
+    chunker = MagicMock(wraps=main.chunk_image)
+    monkeypatch.setattr(main, "chunk_image", chunker)
+
+    assert main.ingest_pdf(
+        str(pdf_path), document_id="report-visuals", tile_width=40,
+        tile_height=30, tile_overlap=5, min_image_size=20,
+    ) == 2
+    chunker.assert_not_called()
+    assert [doc["uuid"] for doc in indexed["docs"]] == ["figure-id", "text-id"]
+    assert {doc["uuid"] for doc in saved} == {"figure-id", "text-id"}
+    assert load_document_manifest("report-visuals")["visual_chunks"] == [{"uuid": "old"}]
+
+    indexed.clear()
+    saved.clear()
+    assert main.ingest_pdf(
+        str(pdf_path),
+        document_id="report-visuals",
+        chunk_visuals=True,
+        tile_width=40,
+        tile_height=30,
+        tile_overlap=5,
+        min_image_size=20,
+    ) == 2
+    assert chunker.call_count == 1
+    manifest_chunks = load_document_manifest("report-visuals")["visual_chunks"]
+    assert len(manifest_chunks) == 9
+    assert all(record["type"] == "ImageTile" for record in manifest_chunks)
+    assert [doc["uuid"] for doc in indexed["docs"]] == ["figure-id", "text-id"]
+    assert {doc["uuid"] for doc in saved} == {"figure-id", "text-id"}
+    assert not {doc["uuid"] for doc in indexed["docs"]}.intersection(
+        record["uuid"] for record in manifest_chunks
+    )
+    report = capsys.readouterr().out
+    assert "Visual child chunks generated: 9" in report
+    assert "Extracted-figure parents chunked: 1" in report
+
+
+@pytest.mark.parametrize(
+    ("include_page_images", "expected_parents"),
+    [(False, 0), (True, 1)],
+)
+def test_page_renders_are_chunked_only_when_page_image_indexing_is_enabled(
+    tmp_path, monkeypatch, capsys, valid_configuration, include_page_images, expected_parents
+):
+    from PIL import Image
+
+    pdf_path = _write_pdf(tmp_path)
+    page_path = tmp_path / "doc_store" / "assets" / "report" / "pages" / "page.png"
+    page_path.parent.mkdir(parents=True)
+    Image.new("RGB", (60, 45), "white").save(page_path)
+    monkeypatch.setattr(main, "get_embedder", lambda: MagicMock())
+    monkeypatch.setattr(main, "get_vector_store", lambda embedder: object())
+    monkeypatch.setattr(
+        main,
+        "partition_pdf",
+        lambda path, document_id=None: [
+            {
+                "uuid": "page-title",
+                "type": "Title",
+                "content": "Page title",
+                "metadata": {"page": 1},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "render_pdf_pages",
+        lambda *args, **kwargs: [
+            {
+                "page_number": 1,
+                "image_path": "assets/report/pages/page.png",
+                "pixel_width": 60,
+                "pixel_height": 45,
+                "page_width": 60,
+                "page_height": 45,
+                "coordinate_system": {"origin": "top-left", "units": "pixels"},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "summarise_images",
+        lambda images: [
+            {**image, "embed_content": "Page image summary"} for image in images
+        ],
+    )
+    indexed = {}
+    monkeypatch.setattr(
+        main, "upsert_documents", lambda docs, _: indexed.update(docs=docs)
+    )
+    monkeypatch.setattr(main, "save_raw_element", lambda _: None)
+    monkeypatch.setattr(main, "save_document_manifest", lambda *args, **kwargs: None)
+
+    assert main.ingest_pdf(
+        str(pdf_path),
+        document_id="report",
+        include_page_images=include_page_images,
+        chunk_visuals=True,
+        tile_width=20,
+        tile_height=20,
+        tile_overlap=5,
+        min_image_size=20,
+    ) == 1 + include_page_images
+    assert "Visual parents discovered: {}".format(expected_parents) in capsys.readouterr().out
+    if include_page_images:
+        assert len(indexed["docs"]) == 2
+        page = next(
+            doc for doc in indexed["docs"] if doc["type"] == "Image"
+        )
+        assert page["metadata"]["extraction_method"] == "pypdfium2_page_render"
+    else:
+        assert [doc["uuid"] for doc in indexed["docs"]] == ["page-title"]
+
+
+def test_page_question_fetches_manifest_render_and_page_elements_exactly(
+    tmp_path, monkeypatch, capsys, valid_configuration
+):
+    from PIL import Image
+
+    paths = {}
+    for page_number in (1, 2, 3):
+        page_path = tmp_path / f"page-{page_number}.png"
+        Image.new("RGB", (12, 8), (page_number * 40, 0, 0)).save(page_path)
+        paths[page_number] = str(page_path)
+    manifest = {
+        "document_id": "report-one",
+        "source_file": "report.pdf",
+        "source_path": r"C:\papers\report.pdf",
+        "page_count": 3,
+        "pages": [
+            {"page_number": page_number, "image_path": paths[page_number]}
+            for page_number in (1, 2, 3)
+        ],
+    }
+    elements_read = []
+
+    def page_elements(document_id, page_number):
+        elements_read.append((document_id, page_number))
+        return [
+            {
+                "uuid": f"title-{page_number}",
+                "type": "Title",
+                "content": f"Page {page_number} title",
+                "metadata": {
+                    "document_id": document_id,
+                    "page": page_number,
+                    "source_file": "report.pdf",
+                },
+            }
+        ]
+
+    monkeypatch.setattr(main, "load_document_manifest", lambda _: manifest)
+    monkeypatch.setattr(main, "load_page_elements", page_elements)
+    monkeypatch.setattr(main, "_check_query_collection", MagicMock())
+    monkeypatch.setattr(main, "get_embedder", MagicMock())
+    monkeypatch.setattr(main, "retrieve", MagicMock())
+    monkeypatch.setattr(main, "search_visual_assets", MagicMock())
+    generated = MagicMock(return_value="Page-specific answer")
+    monkeypatch.setattr(main, "generate_answer", generated)
+
+    answer = main.query_documents(
+        "What is shown on page 2?", document_id="report-one"
+    )
+
+    assert answer == "Page-specific answer"
+    context = generated.call_args.args[1]
+    assert [item["metadata"]["page"] for item in context] == [2, 2]
+    assert context[0]["metadata"]["image_path"] == paths[2]
+    assert context[0]["metadata"]["require_image_evidence"]
+    assert context[1]["content"] == "Page 2 title"
+    assert context[0]["metadata"]["evidence_label"] == (
+        "Document report-one, page 2 (full-page render)"
+    )
+    assert elements_read == [("report-one", 2)]
+    main._check_query_collection.assert_not_called()
+    main.get_embedder.assert_not_called()
+    main.retrieve.assert_not_called()
+    main.search_visual_assets.assert_not_called()
+    output = capsys.readouterr().out
+    assert "report.pdf, page 2" in output
+    assert "page 1" not in output
+
+
+def test_page_comparison_preserves_requested_order_and_includes_every_image(
+    tmp_path, monkeypatch, valid_configuration
+):
+    from PIL import Image
+
+    paths = {}
+    for page_number in (1, 2, 3):
+        page_path = tmp_path / f"comparison-page-{page_number}.png"
+        Image.new("RGB", (10, 8), "white").save(page_path)
+        paths[page_number] = str(page_path)
+    manifest = {
+        "document_id": "report-two",
+        "source_file": "layouts.pdf",
+        "page_count": 3,
+        "pages": [
+            {"page_number": page_number, "image_path": paths[page_number]}
+            for page_number in (1, 2, 3)
+        ],
+    }
+    read_pages = []
+    monkeypatch.setattr(main, "load_document_manifest", lambda _: manifest)
+    monkeypatch.setattr(
+        main,
+        "load_page_elements",
+        lambda document_id, page_number: (
+            read_pages.append((document_id, page_number)) or []
+        ),
+    )
+    monkeypatch.setattr(main, "_check_query_collection", MagicMock())
+    generated = MagicMock(return_value="Comparison")
+    monkeypatch.setattr(main, "generate_answer", generated)
+
+    main.query_documents(
+        "Compare layouts on pages 3, 1, and 2.", document_id="report-two"
+    )
+
+    context = generated.call_args.args[1]
+    page_images = [
+        item
+        for item in context
+        if item.get("metadata", {}).get("evidence_type") == "full_page_render"
+    ]
+    assert [item["metadata"]["page"] for item in page_images] == [3, 1, 2]
+    assert [item["metadata"]["image_path"] for item in page_images] == [
+        paths[3],
+        paths[1],
+        paths[2],
+    ]
+    assert [item["metadata"]["evidence_label"] for item in page_images] == [
+        f"Document report-two, page {page} (full-page render)"
+        for page in (3, 1, 2)
+    ]
+    assert read_pages == [("report-two", 3), ("report-two", 1), ("report-two", 2)]
+    assert any("Child tiles are not searchable" in item["content"] for item in context)
+    main._check_query_collection.assert_not_called()
+
+
+def test_page_question_requires_unambiguous_document_selection(
+    monkeypatch, valid_configuration
+):
+    monkeypatch.setattr(
+        main,
+        "list_document_manifests",
+        lambda: [
+            {"document_id": "report-one", "pages": []},
+            {"document_id": "report-two", "pages": []},
+        ],
+    )
+    generated = MagicMock()
+    monkeypatch.setattr(main, "generate_answer", generated)
+
+    with pytest.raises(main.PaperLensError, match="multiple documents"):
+        main.query_documents("What is shown on page 1?")
+
+    generated.assert_not_called()
+
+
+def test_out_of_range_page_fails_without_semantic_substitution(
+    tmp_path, monkeypatch, valid_configuration
+):
+    from PIL import Image
+
+    page_path = tmp_path / "only-page.png"
+    Image.new("RGB", (10, 10), "white").save(page_path)
+    manifest = {
+        "document_id": "three-page-report",
+        "source_file": "three-pages.pdf",
+        "page_count": 3,
+        "pages": [{"page_number": 1, "image_path": str(page_path)}],
+    }
+    monkeypatch.setattr(main, "load_document_manifest", lambda _: manifest)
+    monkeypatch.setattr(main, "_check_query_collection", MagicMock())
+    generated = MagicMock()
+    monkeypatch.setattr(main, "generate_answer", generated)
+
+    with pytest.raises(main.PaperLensError, match="Page 4 is unavailable.*3 page"):
+        main.query_documents(
+            "Compare page 1 and page 4.", document_id="three-page-report"
+        )
+
+    main._check_query_collection.assert_not_called()
+    generated.assert_not_called()
+
+
+def test_missing_render_fails_clearly_and_does_not_call_generation(
+    monkeypatch, valid_configuration
+):
+    manifest = {
+        "document_id": "no-render",
+        "source_file": "unrendered.pdf",
+        "page_count": 1,
+        "pages": [{"page_number": 1}],
+    }
+    monkeypatch.setattr(main, "load_document_manifest", lambda _: manifest)
+    generated = MagicMock()
+    monkeypatch.setattr(main, "generate_answer", generated)
+
+    with pytest.raises(main.PaperLensError, match="no rendered image"):
+        main.query_documents("What is shown on page 1?", document_id="no-render")
+
+    generated.assert_not_called()
+
+
+def test_unselected_page_query_uses_only_the_single_available_manifest(
+    tmp_path, monkeypatch, valid_configuration
+):
+    from PIL import Image
+
+    image_path = tmp_path / "selected-page.png"
+    Image.new("RGB", (8, 8), "white").save(image_path)
+    manifest = {
+        "document_id": "only-report",
+        "source_file": "only.pdf",
+        "page_count": 1,
+        "pages": [{"page_number": 1, "image_path": str(image_path)}],
+    }
+    monkeypatch.setattr(main, "list_document_manifests", lambda: [manifest])
+    monkeypatch.setattr(
+        main, "load_page_elements", lambda document_id, page_number: []
+    )
+    generated = MagicMock(return_value="Answer")
+    monkeypatch.setattr(main, "generate_answer", generated)
+    monkeypatch.setattr(main, "_check_query_collection", MagicMock())
+
+    assert main.query_documents("What is on page 1?") == "Answer"
+    assert generated.call_args.args[1][0]["metadata"]["document_id"] == "only-report"
+    main._check_query_collection.assert_not_called()
+
+
+def test_optional_ocr_indexes_text_for_pages_without_parser_text(
+    tmp_path, monkeypatch, valid_configuration
+):
+    pdf_path = _write_pdf(tmp_path)
+    monkeypatch.setattr(main, "get_embedder", lambda: MagicMock())
+    monkeypatch.setattr(main, "get_vector_store", lambda embedder: object())
+    monkeypatch.setattr(
+        main, "partition_pdf", lambda path, document_id=None: []
+    )
+    monkeypatch.setattr(
+        main,
+        "render_pdf_pages",
+        lambda *args, **kwargs: [
+            {
+                "page_number": 1,
+                "image_path": "assets/pages/page-00001.png",
+                "pixel_width": 100,
+                "pixel_height": 50,
+                "page_width": 72,
+                "page_height": 36,
+                "coordinate_system": {"origin": "top-left", "units": "pixels"},
+                "rendering": {"library": "pypdfium2", "scale": 1},
+            }
+        ],
+    )
+    ocr_result = {
+        "text": "Scanned report title",
+        "bbox": [4, 5, 50, 15],
+        "page_width": 100,
+        "page_height": 50,
+        "coordinate_system": {"origin": "top-left", "units": "pixels"},
+        "extraction_method": "tesseract_ocr",
+    }
+    ocr = MagicMock(return_value=ocr_result)
+    monkeypatch.setattr(main, "ocr_image", ocr)
+    saved = []
+    indexed = {}
+    monkeypatch.setattr(main, "save_raw_element", saved.append)
+    monkeypatch.setattr(
+        main,
+        "upsert_documents",
+        lambda documents, embedder: indexed.update(documents=documents),
+    )
+
+    assert main.ingest_pdf(str(pdf_path), ocr=True, ocr_language="eng") == 1
+
+    ocr.assert_called_once()
+    element = indexed["documents"][0]
+    assert element["content"] == "Scanned report title"
+    assert element["metadata"]["page"] == 1
+    assert element["metadata"]["bbox"] == [4, 5, 50, 15]
+    assert element["metadata"]["extraction_method"] == "tesseract_ocr"
+    assert element["metadata"]["page_image_path"] == "assets/pages/page-00001.png"

@@ -6,6 +6,7 @@ can be queried for the corresponding raw element.
 """
 
 import os
+import uuid
 from typing import Any
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
@@ -50,4 +51,8 @@ def upsert_documents(docs: list[dict[str, Any]], embedder) -> None:
         )
         for doc in docs
     ]
-    store.add_documents(lc_docs)
+    point_ids = [
+        str(uuid.uuid5(uuid.NAMESPACE_URL, f"paperlens-point:{doc['uuid']}"))
+        for doc in docs
+    ]
+    store.add_documents(lc_docs, ids=point_ids)

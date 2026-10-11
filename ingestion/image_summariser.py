@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from ingestion.assets import resolve_asset_path
 
 def _encode_image(image_path: str) -> str:
     """Base64-encode an image file for the OpenAI vision API."""
@@ -37,14 +38,15 @@ def summarise_images(
     for el in image_elements:
         image_path = el.get("metadata", {}).get("image_path")
 
-        if not image_path or not Path(image_path).exists():
+        resolved_image = resolve_asset_path(image_path) if image_path else None
+        if not resolved_image or not resolved_image.exists():
             # No image file — embed a placeholder
             el["embed_content"] = "[Image: no extractable content]"
             summarised.append(el)
             continue
 
-        encoded = _encode_image(image_path)
-        ext = Path(image_path).suffix.lstrip(".") or "png"
+        encoded = _encode_image(str(resolved_image))
+        ext = resolved_image.suffix.lstrip(".") or "png"
 
         response = client.chat.completions.create(
             model=vision_model,
