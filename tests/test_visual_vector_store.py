@@ -117,6 +117,7 @@ def test_upserts_use_deterministic_ids_and_do_not_duplicate_points(monkeypatch):
     assert client.upsert_calls[1][1][0].id == first_id
     assert len(client.points["clip-vectors"]) == 1
     assert client.points["clip-vectors"][first_id].payload["bbox"] == [0, 0, 10, 10]
+    assert client.upsert_calls[1][1][0].vector == [0.0, 1.0, 0.0]
 
 
 def test_visual_search_applies_document_filter_and_preserves_payload(monkeypatch):
@@ -158,3 +159,23 @@ def test_visual_upsert_rejects_invalid_vector_shapes(monkeypatch):
         upsert_visual_vectors([_record("tile")], [], 2, client)
     with pytest.raises(VisualVectorStoreError, match="dimension 1; expected 2"):
         upsert_visual_vectors([_record("tile")], [[1.0]], 2, client)
+
+
+@pytest.mark.parametrize("vector", [[0.0, 0.0], [float("nan"), 1.0], [float("inf"), 1.0]])
+def test_visual_upsert_rejects_zero_and_nonfinite_vectors(monkeypatch, vector):
+    monkeypatch.setenv("VISUAL_COLLECTION_NAME", "clip-vectors")
+    client = FakeClient()
+
+    with pytest.raises(VisualVectorStoreError):
+        upsert_visual_vectors([_record("tile")], [vector], 2, client)
+    assert not client.upsert_calls
+
+
+def test_visual_search_validates_and_normalizes_query_vector(monkeypatch):
+    monkeypatch.setenv("VISUAL_COLLECTION_NAME", "clip-vectors")
+    client = FakeClient()
+    ensure_visual_collection(2, client)
+
+    search_visual_vectors([3.0, 4.0], limit=1, client=client)
+
+    assert client.query_calls[0]["query"] == [0.6, 0.8]

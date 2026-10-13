@@ -51,6 +51,7 @@ def valid_configuration(monkeypatch, tmp_path):
     monkeypatch.setenv("DOC_STORE_PATH", str(tmp_path / "doc_store"))
     monkeypatch.setattr(main, "render_pdf_pages", lambda *args, **kwargs: [])
     monkeypatch.setattr(main, "save_document_manifest", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "visual_collection_exists", lambda: True)
 
 
 def test_cli_help_for_root_and_commands(capsys):
@@ -395,7 +396,7 @@ def test_query_passes_retrieved_image_and_table_to_generation(
 
     assert answer == "Revenue is $10."
     retrieval.assert_called_once_with(
-        "What is the revenue?", embedder, k=2, document_id="report-1"
+        "What is the revenue?", embedder, k=8, document_id="report-1"
     )
     generated.assert_called_once()
     assert generated.call_args.args[0] == "What is the revenue?"
@@ -428,7 +429,8 @@ def test_numeric_visual_query_without_structured_data_fails_closed(
     monkeypatch.setattr(main, "get_embedder", lambda: "embedder")
     retrieval = MagicMock(return_value=[chart])
     monkeypatch.setattr(main, "retrieve", retrieval)
-    monkeypatch.setattr(main, "search_visual_assets", lambda *args, **kwargs: [])
+    visual_search = MagicMock(return_value=[])
+    monkeypatch.setattr(main, "search_visual_assets", visual_search)
     monkeypatch.setattr(main.Path, "is_file", lambda self: str(self) == "chart.png")
     generated = MagicMock(return_value="The bar appears tallest.")
     monkeypatch.setattr(main, "generate_answer", generated)
@@ -443,8 +445,19 @@ def test_numeric_visual_query_without_structured_data_fails_closed(
         k=4,
         document_id=None,
     )
+    visual_search.assert_not_called()
     generated.assert_not_called()
-    assert "no values were inferred from appearance" in capsys.readouterr().out.lower()
+    output = capsys.readouterr()
+    assert "no values were inferred from appearance" in output.out.lower()
+    diagnostic_line = next(
+        line for line in output.err.splitlines()
+        if '"event": "paperlens_retrieval"' in line
+    )
+    import json
+    diagnostic = json.loads(diagnostic_line.split(": ", 1)[1])
+    assert diagnostic["strategy"] == "structured_numeric_search"
+    assert diagnostic["visual_status"] == "not_requested"
+    assert diagnostic["modalities_run"] == ["text"]
 
 
 def test_index_visuals_cli_does_not_require_openai_credentials(
@@ -555,7 +568,36 @@ def test_visual_query_fuses_text_and_visual_evidence_with_parent_context(
         item["metadata"].get("evidence_type") == "visual_parent_context"
         for item in context
     )
-    assert capsys.readouterr().err == ""
+    assert '"event": "paperlens_retrieval"' in capsys.readouterr().err
+
+
+def test_photo_query_runs_visual_search_and_reports_modalities(
+    monkeypatch, capsys, valid_configuration
+):
+    question = "Find the photo with a modern facade and large glass windows."
+    monkeypatch.setattr(main, "_check_query_collection", lambda: None)
+    monkeypatch.setattr(main, "get_embedder", lambda: "text-embedder")
+    monkeypatch.setattr(main, "retrieve", lambda *args, **kwargs: [{
+        "uuid": "text-1", "type": "NarrativeText", "content": "Building details",
+        "metadata": {"document_id": "doc-1", "page": 2},
+    }])
+    visual_search = MagicMock(return_value=[])
+    monkeypatch.setattr(main, "search_visual_assets", visual_search)
+    monkeypatch.setattr(main, "generate_answer", lambda question, context: "Found on page 2.")
+
+    answer = main.query_documents(question)
+
+    assert answer == "Found on page 2."
+    visual_search.assert_called_once_with(question, limit=12, document_id=None)
+    diagnostic_line = next(
+        line for line in capsys.readouterr().err.splitlines()
+        if '"event": "paperlens_retrieval"' in line
+    )
+    import json
+    diagnostic = json.loads(diagnostic_line.split(": ", 1)[1])
+    assert diagnostic["modalities_run"] == ["text", "visual"]
+    assert diagnostic["visual_status"] == "no_visual_candidates"
+    assert diagnostic["fallback"] == "text_only_no_visual_candidates"
 
 
 def test_visual_query_keeps_semantic_match_when_visual_asset_disappears(

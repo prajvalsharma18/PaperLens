@@ -11,17 +11,37 @@ class FakeProcessor:
     def __init__(self):
         self.image_calls = []
         self.text_calls = []
+        self.tokenizer = FakeTokenizer()
 
     def __call__(self, *, images=None, text=None, **kwargs):
         if images is not None:
             self.image_calls.append(images)
             return {"pixel_values": images}
         self.text_calls.append(text)
+        self.text_kwargs = kwargs
         return {"input_ids": text}
 
 
+class FakeTokenizer:
+    model_max_length = 77
+
+    def __call__(self, text, *, add_special_tokens, truncation):
+        return {"input_ids": text.split()}
+
+    @staticmethod
+    def num_special_tokens_to_add(pair=False):
+        return 2
+
+    @staticmethod
+    def decode(tokens, skip_special_tokens=True):
+        return " ".join(tokens)
+
+
 class FakeModel:
-    config = SimpleNamespace(projection_dim=3)
+    config = SimpleNamespace(
+        projection_dim=3,
+        text_config=SimpleNamespace(max_position_embeddings=77),
+    )
 
     def __init__(self, image_vectors=None, text_vectors=None):
         self.image_vectors = image_vectors or [[3.0, 4.0, 0.0]]
@@ -165,3 +185,51 @@ def test_invalid_dimension_device_and_batch_configuration_fail():
     embedder, _, _ = _fake_embedder()
     with pytest.raises(VisualEmbeddingError, match="batch size must be positive"):
         embedder.encode_images([], batch_size=0)
+
+
+def test_long_text_query_uses_model_context_and_preserves_end_concepts():
+    processor = FakeProcessor()
+    processor.tokenizer.model_max_length = 6
+    model = FakeModel(text_vectors=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    model.config.text_config.max_position_embeddings = 6
+    embedder = VisualEmbedder(
+        processor=processor,
+        model=model,
+        torch_module=FakeTorch(),
+        device="cpu",
+    )
+
+    vector = embedder.encode_text("intro one two three glass tower")
+
+    assert processor.text_calls == [["intro one two three"], ["glass tower"]]
+    assert processor.text_kwargs["max_length"] == 6
+    assert processor.text_kwargs["truncation"] is True
+    assert len(vector) == embedder.dimension
+    assert sum(value * value for value in vector) == pytest.approx(1.0)
+    assert embedder.last_text_query_diagnostics == {
+        "token_count": 6,
+        "chunk_count": 2,
+        "omitted_token_count": 0,
+        "context_limit": 6,
+    }
+
+
+def test_extremely_long_visual_query_has_fixed_two_chunk_budget():
+    processor = FakeProcessor()
+    processor.tokenizer.model_max_length = 6
+    model = FakeModel(
+        text_vectors=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    )
+    model.config.text_config.max_position_embeddings = 6
+    embedder = VisualEmbedder(
+        processor=processor,
+        model=model,
+        torch_module=FakeTorch(),
+        device="cpu",
+    )
+
+    embedder.encode_text("one two three four five six seven eight nine ten")
+
+    assert processor.text_calls == [["one two three four"], ["seven eight nine ten"]]
+    assert embedder.last_text_query_diagnostics["chunk_count"] == 2
+    assert embedder.last_text_query_diagnostics["omitted_token_count"] == 2

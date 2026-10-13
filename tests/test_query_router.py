@@ -46,7 +46,7 @@ from retrieval.query_router import (
             "What is the exact value of the tallest bar?",
             "numeric_visual_question",
             (),
-            "semantic_visual_search",
+            "structured_numeric_search",
         ),
     ],
 )
@@ -69,6 +69,66 @@ def test_explicit_page_ranges_and_visual_references_are_normalized():
     assert plan.visual_references == ("figure 7", "table 3")
     assert plan.requires_full_page_visual
     assert plan.requires_multiple_evidence
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Search across all indexed documents for a diagram or flowchart of a process. Identify the matching document and page number.",
+        "Which document and source PDF contains the visual explanation? Identify the page.",
+        "Find the diagram and report its page number.",
+        "Find a diagram and identify its source PDF and page number.",
+    ],
+)
+def test_page_provenance_language_does_not_request_numeric_chart_analysis(question):
+    plan = create_query_plan(question)
+
+    assert plan.intent == "visual_question"
+    assert plan.visual_question
+    assert not plan.chart_digitization_desirable
+    assert plan.retrieval_strategy == "semantic_visual_search"
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Find the photo with a modern facade and large glass windows.",
+        "Find a photograph showing the modern glass facade.",
+        "Search for a picture of the building with large windows.",
+        "Locate the image that shows the modern facade.",
+        "Find visual evidence of the building's glass windows.",
+        "Find the modern facade with large glass windows.",
+    ],
+)
+def test_natural_visual_search_phrases_use_semantic_visual_retrieval(question):
+    plan = create_query_plan(question)
+
+    assert plan.visual_question
+    assert plan.retrieval_strategy == "semantic_visual_search"
+    assert not plan.chart_digitization_desirable
+
+
+@pytest.mark.parametrize(
+    ("question", "intent", "strategy", "chart_digitization"),
+    [
+        ("What does the paper say about image processing?", "general_question", "semantic_search", False),
+        ("Summarize the author's conclusion about the experiment.", "general_question", "semantic_search", False),
+        ("Find the photo with large windows on page 2.", "page_question", "exact_page", False),
+        ("What is the exact value of the tallest bar?", "numeric_visual_question", "structured_numeric_search", True),
+        ("What is the maximum value in the chart?", "numeric_visual_question", "structured_numeric_search", True),
+        ("What is the difference between A and B in the chart?", "numeric_visual_question", "structured_numeric_search", True),
+        ("Calculate the total of the bars in the chart.", "numeric_visual_question", "structured_numeric_search", True),
+        ("How many windows are visible in the photo?", "visual_question", "semantic_visual_search", False),
+    ],
+)
+def test_visual_routing_preserves_text_page_and_numeric_intents(
+    question, intent, strategy, chart_digitization
+):
+    plan = create_query_plan(question)
+
+    assert plan.intent == intent
+    assert plan.retrieval_strategy == strategy
+    assert plan.chart_digitization_desirable is chart_digitization
 
 
 @pytest.mark.parametrize(

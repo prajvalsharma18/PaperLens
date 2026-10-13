@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import uuid
 from typing import Any
@@ -24,6 +25,23 @@ DEFAULT_VISUAL_COLLECTION = "rag_visuals"
 
 class VisualVectorStoreError(RuntimeError):
     """Raised for visual collection configuration or Qdrant failures."""
+
+
+def _unit_vector(vector: Any, vector_size: int, label: str) -> list[float]:
+    try:
+        values = [float(value) for value in vector]
+    except (TypeError, ValueError) as exc:
+        raise VisualVectorStoreError(f"{label} contains a non-numeric value.") from exc
+    if len(values) != vector_size:
+        raise VisualVectorStoreError(
+            f"{label} has dimension {len(values)}; expected {vector_size}."
+        )
+    if not all(math.isfinite(value) for value in values):
+        raise VisualVectorStoreError(f"{label} contains a non-finite value.")
+    norm = math.sqrt(sum(value * value for value in values))
+    if not math.isfinite(norm) or norm == 0:
+        raise VisualVectorStoreError(f"{label} has an invalid or zero magnitude.")
+    return [value / norm for value in values]
 
 
 def visual_collection_name() -> str:
@@ -104,11 +122,7 @@ def upsert_visual_vectors(
             raise VisualVectorStoreError(
                 "Visual record is missing its stable element or chunk ID."
             )
-        if len(vector) != vector_size:
-            raise VisualVectorStoreError(
-                f"Visual vector for {element_id!r} has dimension {len(vector)}; "
-                f"expected {vector_size}."
-            )
+        vector = _unit_vector(vector, vector_size, f"Visual vector for {element_id!r}")
         payload = {key: value for key, value in record.items() if value is not None}
         points.append(
             PointStruct(
@@ -171,6 +185,18 @@ def search_visual_vectors(
     client = client or _get_client()
     if not visual_collection_exists(client):
         return []
+    try:
+        collection_info = client.get_collection(visual_collection_name())
+        vector_size = getattr(collection_info.config.params.vectors, "size", None)
+    except Exception as exc:
+        raise VisualVectorStoreError(
+            f"Could not inspect visual Qdrant collection {visual_collection_name()!r}: {exc}"
+        ) from exc
+    if not isinstance(vector_size, int) or vector_size < 1:
+        raise VisualVectorStoreError(
+            f"Visual collection {visual_collection_name()!r} has no usable vector dimension."
+        )
+    query_vector = _unit_vector(query_vector, vector_size, "Visual query vector")
     query_filter = (
         Filter(
             must=[

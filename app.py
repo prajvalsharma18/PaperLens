@@ -102,7 +102,9 @@ def render_upload() -> None:
             use_ocr = st.checkbox("Run optional Tesseract OCR")
             chunk_visuals = st.checkbox("Create deterministic visual crops for large images")
             confirm = st.checkbox("I’m ready to save this PDF and start ingestion")
-            submitted = st.form_submit_button("Save PDF and ingest", type="primary", disabled=not confirm)
+            submitted = st.form_submit_button("Save PDF and ingest", type="primary")
+        if submitted and not confirm:
+            st.warning("Check the confirmation box before starting ingestion.")
         if submitted and confirm:
             try:
                 document_id, path = services.save_upload(upload.name, content, limit)

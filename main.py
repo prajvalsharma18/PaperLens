@@ -38,6 +38,7 @@ from retrieval.document_store import (
     save_document_manifest,
     save_raw_element,
 )
+from retrieval.evidence_dedup import attach_source_hashes, deduplicate_evidence
 from retrieval.embedder import get_embedder
 from retrieval.hybrid_retriever import select_hybrid_candidates
 from retrieval.multi_vector_retriever import retrieve
@@ -49,7 +50,7 @@ from retrieval.visual_indexer import (
     index_document_visual_assets,
     search_visual_assets,
 )
-from retrieval.visual_vector_store import VisualVectorStoreError
+from retrieval.visual_vector_store import VisualVectorStoreError, visual_collection_exists
 
 
 class PaperLensError(Exception):
@@ -436,6 +437,10 @@ def ingest_pdf(
         if chunk_visuals
         else (existing_manifest or {}).get("visual_chunks", [])
     )
+    try:
+        source_content_hash = _file_sha256(path)
+    except OSError as exc:
+        raise PaperLensError(f"Could not calculate the PDF content hash: {exc}") from exc
 
     try:
         save_document_manifest(
@@ -444,7 +449,7 @@ def ingest_pdf(
                 "document_id": assigned_document_id,
                 "source_file": path.name,
                 "source_path": str(path),
-                "source_content_hash": _file_sha256(path),
+                "source_content_hash": source_content_hash,
                 "page_count": len(rendered_pages),
                 "visual_chunks": manifest_chunks,
                 "pages": [
@@ -464,6 +469,8 @@ def ingest_pdf(
         raise PaperLensError(f"Could not save document provenance manifest: {exc}") from exc
 
     prepared, skipped = _prepare_documents(elements, assigned_document_id)
+    for element in prepared:
+        element.setdefault("metadata", {})["source_content_hash"] = source_content_hash
     if not prepared:
         reasons = ", ".join(f"{count} {reason}" for reason, count in sorted(skipped.items()))
         raise PaperLensError(
@@ -588,7 +595,7 @@ def _query_guidance(plan: QueryPlan) -> list[dict[str, Any]]:
                 ),
             }
         )
-    if plan.visual_question:
+    if plan.visual_question and not plan.chart_digitization_desirable:
         guidance.append(
             {
                 "type": "NarrativeText",
@@ -882,6 +889,90 @@ def _visual_evidence_limit() -> int:
     return limit
 
 
+def _source_content_hashes() -> dict[str, str]:
+    """Read PDF hashes from manifests for conservative cross-ingest deduping."""
+    return {
+        str(manifest["document_id"]): str(manifest["source_content_hash"])
+        for manifest in list_document_manifests()
+        if manifest.get("document_id") and manifest.get("source_content_hash")
+    }
+
+
+def _retrieval_status_evidence(status: str, candidate_count: int = 0) -> dict[str, Any]:
+    messages = {
+        "visual_candidates": (
+            f"Visual retrieval returned {candidate_count} ranked candidate(s). "
+            "Similarity rank is not a calibrated confidence score. A missing "
+            "object in these candidates does not prove it is absent from the full index."
+        ),
+        "no_visual_candidates": (
+            "Visual retrieval completed but returned no usable candidates. This "
+            "does not establish that the requested subject is absent from the full index."
+        ),
+        "visual_index_missing": (
+            "No visual collection is available, so CLIP visual retrieval was not run. "
+            "Do not describe the images as visually searched."
+        ),
+        "visual_failed": (
+            "CLIP visual retrieval failed. Only semantic text results are available; "
+            "do not describe this as a successful visual search."
+        ),
+        "visual_assets_unavailable": (
+            "Visual candidates were returned, but their image assets could not be "
+            "loaded. No image inspection was performed for those candidates."
+        ),
+    }
+    return {
+        "uuid": f"retrieval-status:{status}",
+        "type": "NarrativeText",
+        "content": messages[status],
+        "metadata": {"retrieval_status": status, "evidence_type": "retrieval_diagnostic"},
+    }
+
+
+def _log_retrieval_diagnostics(
+    plan: QueryPlan,
+    context: list[dict[str, Any]],
+    *,
+    visual_status: str,
+    fallback: str | None,
+    candidate_counts: dict[str, int],
+    modalities_run: list[str],
+    modalities_attempted: list[str],
+) -> None:
+    evidence = []
+    for rank, item in enumerate(context, start=1):
+        metadata = item.get("metadata", {})
+        if metadata.get("evidence_type") == "retrieval_diagnostic":
+            continue
+        sources = metadata.get("retrieval_sources", item.get("retrieval_sources", {}))
+        modalities = sorted(sources) if isinstance(sources, dict) else []
+        if not modalities:
+            modalities = ["page"] if plan.retrieval_strategy == "exact_page" else ["text"]
+        evidence.append({
+            "document_id": metadata.get("document_id"),
+            "page": metadata.get("page", metadata.get("page_number")),
+            "element_id": item.get("uuid") or metadata.get("element_id"),
+            "evidence_id": metadata.get("evidence_id"),
+            "modalities": modalities,
+            "rank": metadata.get("visual_rank", rank),
+            "visual_score": item.get("visual_score"),
+            "rrf_score": metadata.get("rrf_score", item.get("rrf_score")),
+            "duplicate_document_ids": metadata.get("duplicate_document_ids", []),
+        })
+    diagnostic = {
+        "event": "paperlens_retrieval",
+        "strategy": plan.retrieval_strategy,
+        "visual_status": visual_status,
+        "fallback": fallback,
+        "candidate_counts": candidate_counts,
+        "modalities_attempted": modalities_attempted,
+        "modalities_run": modalities_run,
+        "selected_evidence": evidence,
+    }
+    print("Retrieval diagnostics: " + json.dumps(diagnostic, ensure_ascii=False), file=sys.stderr)
+
+
 def _related_structured_evidence(
     plan: QueryPlan,
     context: list[dict[str, Any]],
@@ -970,46 +1061,96 @@ def query_documents(
         raise PaperLensError(str(exc)) from exc
     answer = _structured_numeric_answer(question, plan)
     if answer is not None:
+        _log_retrieval_diagnostics(
+            plan,
+            [],
+            visual_status="not_requested",
+            fallback="structured_numeric_evidence_short_circuit",
+            candidate_counts={"text": 0, "visual": 0},
+            modalities_run=[],
+            modalities_attempted=[],
+        )
         print("Answer:")
         print(answer)
         return answer
     _validate_configuration()
 
+    visual_status = "not_requested"
+    visual_fallback: str | None = None
+    candidate_counts = {"text": 0, "visual": 0}
+    modalities_run: list[str] = []
+    modalities_attempted: list[str] = []
     if plan.retrieval_strategy == "exact_page":
         context = _page_evidence(plan)
+        modalities_run = ["page"]
+        modalities_attempted = ["page"]
+        candidate_counts["text"] = len(context)
     else:
         _check_query_collection()
         try:
             embedder = get_embedder()
-            context = retrieve(question, embedder, k=k, document_id=document_id)
+            retrieval_k = k if plan.chart_digitization_desirable else min(100, k * 4)
+            context = retrieve(question, embedder, k=retrieval_k, document_id=document_id)
         except Exception as exc:
             raise PaperLensError(
                 "Retrieval failed. Check the embedding configuration and Qdrant collection."
             ) from exc
-        if plan.visual_question:
+        modalities_run = ["text"]
+        modalities_attempted = ["text"]
+        raw_text_candidate_count = len(context)
+        source_hashes = _source_content_hashes()
+        context = deduplicate_evidence(
+            attach_source_hashes(context, source_hashes)
+        )[:k]
+        candidate_counts["text"] = raw_text_candidate_count
+        if plan.visual_question and not plan.chart_digitization_desirable:
+            modalities_attempted.append("visual")
+            visual_limit = _visual_evidence_limit()
             try:
-                visual_limit = _visual_evidence_limit()
-                visual_candidates = search_visual_assets(
-                    question,
-                    limit=max(k, visual_limit * 3),
-                    document_id=document_id,
-                )
+                if not visual_collection_exists():
+                    visual_status = "visual_index_missing"
+                    visual_candidates = []
+                else:
+                    modalities_run.append("visual")
+                    visual_candidates = search_visual_assets(
+                        question,
+                        limit=max(k, visual_limit * 3),
+                        document_id=document_id,
+                    )
             except (
                 VisualEmbeddingError,
                 VisualVectorStoreError,
                 VisualIndexError,
             ) as exc:
+                visual_status = "visual_failed"
+                visual_fallback = "text_only_visual_retrieval_failure"
                 print(
                     f"Visual retrieval unavailable; using semantic results only: {exc}",
                     file=sys.stderr,
                 )
             else:
+                visual_candidates = deduplicate_evidence(
+                    attach_source_hashes(visual_candidates, source_hashes)
+                )
+                candidate_counts["visual"] = len(visual_candidates)
                 if not visual_candidates:
-                    print(
-                        "Visual index is unavailable or empty; using semantic "
-                        "results only.",
-                        file=sys.stderr,
+                    if visual_status != "visual_index_missing":
+                        visual_status = "no_visual_candidates"
+                    visual_fallback = (
+                        "text_only_visual_collection_missing"
+                        if visual_status == "visual_index_missing"
+                        else "text_only_no_visual_candidates"
                     )
+                    if visual_status == "visual_index_missing":
+                        print(
+                            "Visual collection is missing; using semantic results only.",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            "Visual retrieval returned no candidates; using semantic results only.",
+                            file=sys.stderr,
+                        )
                 else:
                     candidates = select_hybrid_candidates(
                         context,
@@ -1035,17 +1176,33 @@ def query_documents(
                     )
                     if visual_context:
                         context = selected_text + visual_context
+                        visual_status = "visual_candidates"
                     else:
+                        visual_status = "visual_assets_unavailable"
+                        visual_fallback = "text_only_visual_assets_unavailable"
                         print(
                             "Visual evidence assets are unavailable; using semantic "
                             "results only.",
                             file=sys.stderr,
                         )
                         context = semantic_context
+            context.append(_retrieval_status_evidence(
+                visual_status, candidate_counts["visual"]
+            ))
         context.extend(_query_guidance(plan))
 
     if plan.visual_question:
         context.extend(_related_structured_evidence(plan, context))
+
+    _log_retrieval_diagnostics(
+        plan,
+        context,
+        visual_status=visual_status,
+        fallback=visual_fallback,
+        candidate_counts=candidate_counts,
+        modalities_run=modalities_run,
+        modalities_attempted=modalities_attempted,
+    )
 
     if (
         plan.chart_digitization_desirable

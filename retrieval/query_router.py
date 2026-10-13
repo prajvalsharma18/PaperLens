@@ -35,13 +35,33 @@ _VISUAL_REFERENCE = re.compile(
 )
 _VISUAL_TERMS = re.compile(
     r"\b(figure|figures|chart|charts|table|tables|diagram|diagrams|"
-    r"image|images|graph|graphs|plot|plots|layout|layouts|visual|visuals|bar|bars)\b",
+    r"graph|graphs|plot|plots|layout|layouts|visual|visuals|bar|bars)\b",
+    re.IGNORECASE,
+)
+_VISUAL_MEDIA_TERMS = re.compile(
+    r"\b(image|images|photo|photos|photograph|photographs|picture|pictures)\b",
+    re.IGNORECASE,
+)
+_VISUAL_SEARCH_ACTION = re.compile(
+    r"\b(find|locate|search(?:\s+for)?|look\s+for|show(?:\s+me)?|identify|"
+    r"describe|depict|shown?|pictured|visible)\b",
+    re.IGNORECASE,
+)
+_VISUAL_FEATURE_TERMS = re.compile(
+    r"\b(facade|façade|window|windows|glass|roof|rooftop|door|doors|"
+    r"building|architecture|architectural|bridge|skyline|landscape|"
+    r"vehicle|person|people|object|signage|interior|exterior)\b",
+    re.IGNORECASE,
+)
+_CHART_TABLE_TERMS = re.compile(
+    r"\b(chart|table|graph|plot|bar|bars|percentage|percent)\b",
     re.IGNORECASE,
 )
 _NUMERIC_VISUAL_TERMS = re.compile(
-    r"\b(exact|value|values|number|amount|how many|tallest|highest|"
-    r"lowest|shortest|numeric|numerical|percentage|percent|compare|comparison|"
-    r"difference|delta|calculation|calculate|computed|sum|total)\b",
+    r"\b(exact|value|values|amount|number|numbers|what was|how many|count|"
+    r"tallest|highest|largest|most|maximum|max|lowest|shortest|smallest|"
+    r"least|minimum|min|numeric|numerical|percentage|percent|compare|"
+    r"comparison|difference|delta|calculation|calculate|computed|sum|total)\b",
     re.IGNORECASE,
 )
 _COMPARISON_TERMS = re.compile(
@@ -104,8 +124,24 @@ def create_query_plan(
     """Build a query plan without external model calls."""
     page_numbers = extract_page_references(question)
     comparison = bool(_COMPARISON_TERMS.search(question))
-    visual = bool(_VISUAL_TERMS.search(question))
-    numeric_visual = visual and bool(_NUMERIC_VISUAL_TERMS.search(question))
+    visual = bool(
+        _VISUAL_TERMS.search(question)
+        or (
+            _VISUAL_MEDIA_TERMS.search(question)
+            and _VISUAL_SEARCH_ACTION.search(question)
+        )
+        or (
+            _VISUAL_SEARCH_ACTION.search(question)
+            and _VISUAL_FEATURE_TERMS.search(question)
+        )
+    )
+    # Requests to count visible objects are visual questions. Reserve the
+    # structured numeric route for chart/table-like data evidence.
+    numeric_visual = (
+        visual
+        and bool(_CHART_TABLE_TERMS.search(question))
+        and bool(_NUMERIC_VISUAL_TERMS.search(question))
+    )
     references = tuple(
         f"{match.group(1).lower().rstrip('.')} {match.group(2)}"
         for match in _VISUAL_REFERENCE.finditer(question)
@@ -124,6 +160,8 @@ def create_query_plan(
 
     if page_numbers:
         strategy = "exact_page"
+    elif numeric_visual:
+        strategy = "structured_numeric_search"
     elif visual:
         strategy = "semantic_visual_search"
     else:

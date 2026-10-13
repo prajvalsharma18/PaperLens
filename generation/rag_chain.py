@@ -174,6 +174,12 @@ def generate_answer(question: str, context: list[dict[str, Any]]) -> str:
         "Each labelled image is identified by its document and page; keep "
         "evidence associated with the page named in its label, especially when "
         "comparing pages. "
+        "Visual retrieval results are a ranked, limited sample of the indexed images, "
+        "not a calibrated confidence score or an exhaustive scan. Never conclude "
+        "that a subject is absent from the full collection because it is missing "
+        "from the retrieved candidates. Follow retrieval diagnostic evidence: if "
+        "visual retrieval was unavailable or failed, do not say that you visually "
+        "searched the collection. "
         "If the answer cannot be determined from the context, say so clearly. "
         "Do not hallucinate."
     )

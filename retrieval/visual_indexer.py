@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,7 @@ def _valid_image_size(path: Path) -> tuple[int, int]:
 def _parent_record(
     document_id: str,
     element: dict[str, Any],
+    source_content_hash: str | None = None,
 ) -> dict[str, Any]:
     metadata = element.get("metadata", {})
     element_id = element.get("uuid") or metadata.get("element_id")
@@ -74,12 +76,17 @@ def _parent_record(
         "image_width": width,
         "image_height": height,
         "content_hash": metadata.get("content_hash"),
+        "source_content_hash": source_content_hash,
         "extraction_method": metadata.get("extraction_method"),
         "_resolved_path": str(resolved_path),
     }
 
 
-def _tile_record(document_id: str, tile: dict[str, Any]) -> dict[str, Any]:
+def _tile_record(
+    document_id: str,
+    tile: dict[str, Any],
+    source_content_hash: str | None = None,
+) -> dict[str, Any]:
     metadata = tile.get("metadata", {})
     element_id = tile.get("uuid") or metadata.get("element_id")
     asset_path = metadata.get("child_image_path")
@@ -113,6 +120,7 @@ def _tile_record(document_id: str, tile: dict[str, Any]) -> dict[str, Any]:
         "parent_width": metadata.get("parent_width"),
         "parent_height": metadata.get("parent_height"),
         "content_hash": metadata.get("content_hash"),
+        "source_content_hash": source_content_hash,
         "chunking_method": metadata.get("chunking_method"),
         "chunking_parameters": parameters,
         "tile_row": metadata.get("tile_row"),
@@ -132,11 +140,12 @@ def discover_visual_assets(
     records: list[dict[str, Any]] = []
     skipped: Counter[str] = Counter()
     seen: set[str] = set()
+    source_content_hash = manifest.get("source_content_hash")
     for element in elements:
         if element.get("type") != "Image":
             continue
         try:
-            record = _parent_record(document_id, element)
+            record = _parent_record(document_id, element, source_content_hash)
         except (OSError, ValueError) as exc:
             skipped[str(exc)] += 1
             continue
@@ -155,7 +164,7 @@ def discover_visual_assets(
             skipped["Manifest contains a malformed visual tile record."] += 1
             continue
         try:
-            record = _tile_record(document_id, tile)
+            record = _tile_record(document_id, tile, source_content_hash)
         except (OSError, ValueError) as exc:
             skipped[str(exc)] += 1
             continue
@@ -245,15 +254,24 @@ def search_visual_assets(
         return []
     query_vector = model.encode_text(question)
     try:
+        oversample = int(os.getenv("VISUAL_RETRIEVAL_OVERSAMPLE", "8"))
+    except ValueError as exc:
+        raise VisualIndexError("VISUAL_RETRIEVAL_OVERSAMPLE must be a positive integer.") from exc
+    if oversample < 1:
+        raise VisualIndexError("VISUAL_RETRIEVAL_OVERSAMPLE must be a positive integer.")
+    try:
         points = search_visual_vectors(
             query_vector,
-            limit=limit,
+            # Over-fetch before parent aggregation so many high-ranked tiles
+            # from one image do not hide distinct pages and figures.
+            limit=max(limit, limit * oversample),
             document_id=document_id,
             client=client,
         )
     except VisualVectorStoreError:
         raise
     results: list[dict[str, Any]] = []
+    best_by_parent: dict[tuple[str, str], dict[str, Any]] = {}
     for point in points:
         payload = getattr(point, "payload", None)
         if not isinstance(payload, dict):
@@ -269,8 +287,7 @@ def search_visual_assets(
             _valid_image_size(resolved_path)
         except ValueError:
             continue
-        results.append(
-            {
+        result = {
                 "uuid": str(element_id),
                 "type": "Image",
                 "content": "",
@@ -282,5 +299,17 @@ def search_visual_assets(
                 },
                 "visual_score": getattr(point, "score", None),
             }
+        identity = (
+            str(payload.get("document_id", "")),
+            str(payload.get("root_source_id") or payload.get("parent_id") or element_id),
         )
+        previous = best_by_parent.get(identity)
+        if previous is None or (result["visual_score"] or 0) > (previous["visual_score"] or 0):
+            best_by_parent[identity] = result
+    results = sorted(
+        best_by_parent.values(),
+        key=lambda item: (-(item.get("visual_score") or 0), item.get("uuid", "")),
+    )[:limit]
+    for rank, result in enumerate(results, start=1):
+        result["metadata"]["visual_rank"] = rank
     return results

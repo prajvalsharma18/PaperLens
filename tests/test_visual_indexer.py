@@ -248,10 +248,11 @@ def test_visual_query_uses_fake_text_encoder_and_converts_results(
         "validate_visual_collection_dimension",
         lambda dimension, provided_client=None: dimension == 3,
     )
+    search_limits = []
     monkeypatch.setattr(
         visual_indexer,
         "search_visual_vectors",
-        lambda vector, limit, document_id=None, client=None: [
+        lambda vector, limit, document_id=None, client=None: search_limits.append(limit) or [
             SimpleNamespace(
                 payload={
                     "element_id": "tile-1",
@@ -280,3 +281,35 @@ def test_visual_query_uses_fake_text_encoder_and_converts_results(
     assert results[0]["metadata"]["image_path"] == str(image_path)
     assert results[0]["metadata"]["page"] == 4
     assert results[0]["visual_score"] == 0.9
+    assert search_limits == [32]
+
+
+def test_visual_search_overfetches_then_keeps_one_hit_per_parent(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DOC_STORE_PATH", str(tmp_path / "store"))
+    paths = []
+    points = []
+    for index, (parent, score) in enumerate(
+        [("parent-a", 0.99), ("parent-a", 0.98), ("parent-a", 0.97), ("parent-b", 0.96)]
+    ):
+        path = tmp_path / f"{index}.png"
+        Image.new("RGB", (10, 8), "orange").save(path)
+        paths.append(path)
+        points.append(SimpleNamespace(
+            payload={
+                "element_id": f"tile-{index}", "document_id": "doc",
+                "asset_path": str(path), "root_source_id": parent,
+                "chunk_type": "image_tile", "page_number": index + 1,
+            },
+            score=score,
+        ))
+    requested_limits = []
+    monkeypatch.setattr("retrieval.visual_vector_store.visual_collection_exists", lambda provided_client=None: True)
+    monkeypatch.setattr(visual_indexer, "validate_visual_collection_dimension", lambda *args: True)
+    monkeypatch.setattr(visual_indexer, "search_visual_vectors", lambda vector, limit, **kwargs: requested_limits.append(limit) or points)
+
+    results = search_visual_assets("diagram", limit=2, embedder=FakeEmbedder())
+
+    assert requested_limits == [16]
+    assert [result["uuid"] for result in results] == ["tile-0", "tile-3"]

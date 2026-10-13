@@ -73,6 +73,12 @@ class VisualEmbedder:
                 "config.projection_dim. Use a compatible CLIPModel."
             )
         self.dimension = dimension
+        self.last_text_query_diagnostics: dict[str, int] = {
+            "token_count": 0,
+            "chunk_count": 0,
+            "omitted_token_count": 0,
+            "context_limit": 0,
+        }
 
     def _model_inputs(self, inputs: Any) -> dict[str, Any]:
         if hasattr(inputs, "to"):
@@ -183,12 +189,104 @@ class VisualEmbedder:
         if not text.strip():
             raise VisualEmbeddingError("Visual search query cannot be empty.")
         try:
-            inputs = self._model_inputs(
-                self.processor(text=[text], return_tensors="pt", padding=True)
+            tokenizer = getattr(self.processor, "tokenizer", None)
+            if tokenizer is None:
+                raise VisualEmbeddingError(
+                    "The visual processor does not expose its tokenizer; "
+                    "cannot safely bound CLIP query length."
+                )
+            config = getattr(self.model, "config", None)
+            text_config = getattr(config, "text_config", None)
+            limits = [
+                getattr(tokenizer, "model_max_length", None),
+                getattr(text_config, "max_position_embeddings", None),
+            ]
+            supported_limits = [
+                int(limit)
+                for limit in limits
+                if isinstance(limit, (int, float))
+                and 2 <= limit < 1_000_000
+            ]
+            if not supported_limits:
+                raise VisualEmbeddingError(
+                    "The visual tokenizer and model do not expose a usable text context limit."
+                )
+            context_limit = min(supported_limits)
+            special_tokens = tokenizer.num_special_tokens_to_add(pair=False)
+            content_limit = context_limit - special_tokens
+            if content_limit < 1:
+                raise VisualEmbeddingError(
+                    "The visual tokenizer context has no room for query content."
+                )
+            tokenized = tokenizer(
+                text,
+                add_special_tokens=False,
+                truncation=False,
             )
-            with self._torch.inference_mode():
-                output = self.model.get_text_features(**inputs)
-            return self._normalize_batch(output, expected_count=1)[0]
+            token_ids = tokenized["input_ids"]
+            if token_ids and isinstance(token_ids[0], (list, tuple)):
+                token_ids = token_ids[0]
+            token_ids = list(token_ids)
+            if len(token_ids) <= content_limit:
+                windows = [token_ids]
+                omitted_tokens = 0
+            elif len(token_ids) <= 2 * content_limit:
+                windows = [
+                    token_ids[:content_limit],
+                    token_ids[content_limit:],
+                ]
+                omitted_tokens = 0
+            else:
+                # A fixed two-window budget keeps retrieval cost and ranking
+                # opportunity independent of arbitrarily long user prompts.
+                windows = [
+                    token_ids[:content_limit],
+                    token_ids[-content_limit:],
+                ]
+                omitted_tokens = len(token_ids) - 2 * content_limit
+
+            chunks = [
+                tokenizer.decode(window, skip_special_tokens=True)
+                for window in windows
+                if window
+            ]
+            if not chunks:
+                raise VisualEmbeddingError("Visual search query has no content tokens.")
+
+            self.last_text_query_diagnostics = {
+                "token_count": len(token_ids),
+                "chunk_count": len(chunks),
+                "omitted_token_count": omitted_tokens,
+                "context_limit": context_limit,
+            }
+            vectors = []
+            for chunk in chunks:
+                inputs = self._model_inputs(
+                    self.processor(
+                        text=[chunk],
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=context_limit,
+                    )
+                )
+                with self._torch.inference_mode():
+                    output = self.model.get_text_features(**inputs)
+                vectors.extend(self._normalize_batch(output, expected_count=1))
+
+            # Average normalized chunk vectors into a single query vector.
+            # This keeps one Qdrant search and avoids extra rank/score mass for
+            # queries that happen to contain more chunks.
+            merged = [
+                sum(vector[index] for vector in vectors) / len(vectors)
+                for index in range(self.dimension)
+            ]
+            norm = math.sqrt(sum(value * value for value in merged))
+            if not math.isfinite(norm) or norm == 0:
+                raise VisualEmbeddingError(
+                    "Visual query chunks produced an invalid merged embedding."
+                )
+            return [value / norm for value in merged]
         except VisualEmbeddingError:
             raise
         except Exception as exc:
